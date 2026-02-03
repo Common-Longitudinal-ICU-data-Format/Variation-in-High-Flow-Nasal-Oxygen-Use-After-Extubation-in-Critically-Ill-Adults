@@ -1,0 +1,6 @@
+{
+  "site" : "ur site name here",
+  "data_directory": "./data",
+  "filetype": "parquet",
+  "timezone": "US/Central"
+}

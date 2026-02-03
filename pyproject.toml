@@ -1,0 +1,11 @@
+[project]
+name = "variation-in-high-flow-nasal-oxygen-use-after-extubation-in-critically-ill-adults"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "clifpy>=0.3.8",
+    "marimo>=0.10.0",
+    "tqdm>=4.67.2",
+]
