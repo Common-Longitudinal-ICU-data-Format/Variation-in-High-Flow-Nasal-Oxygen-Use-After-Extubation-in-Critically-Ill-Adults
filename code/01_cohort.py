@@ -12,7 +12,8 @@ def _():
     import json
     from pathlib import Path
     from tqdm import tqdm
-    from clifpy.tables import Hospitalization, RespiratorySupport, Adt, CodeStatus, Labs, Patient
+    from clifpy.tables import Hospitalization, RespiratorySupport, Adt, CodeStatus, Labs, Patient, Vitals
+    from clifpy import compute_sofa_polars
     return (
         Adt,
         CodeStatus,
@@ -21,6 +22,8 @@ def _():
         Path,
         Patient,
         RespiratorySupport,
+        Vitals,
+        compute_sofa_polars,
         json,
         mo,
         pd,
@@ -328,7 +331,7 @@ def _(icu_adt_df, pl, resp_df):
     )
 
     # Rename ICU timing columns for clarity
-    first_icu = first_icu.rename({"in_dttm": "icu_start", "out_dttm": "icu_end"})
+    first_icu = first_icu.rename({"in_dttm": "icu_start", "out_dttm": "icu_end", "location_type": "icu_type"})
 
     # Compute ICU LOS in hours
     first_icu = first_icu.with_columns(
@@ -564,6 +567,121 @@ def _(DATA_DIR, FILETYPE, Labs, TIMEZONE, intub_extub, pl):
 
 
 @app.cell
+def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, intub_extub, pl):
+    # Step C2b: Load Vitals for height and weight before extubation
+    hosp_ids_for_vitals = intub_extub["hospitalization_id"].to_list()
+    vitals_table = Vitals.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={
+            "hospitalization_id": hosp_ids_for_vitals,
+            "vital_category": ["height_cm", "weight_kg"],
+        },
+    )
+    vitals_df = vitals_table.df.copy()
+    vitals_df["recorded_dttm"] = vitals_df["recorded_dttm"].dt.tz_localize(None)
+    vitals_pl = pl.from_pandas(vitals_df)
+    del vitals_df
+
+    # Join with intub_extub to get extubation_time, filter to before extubation
+    vitals_pre_extub = (
+        vitals_pl
+        .join(
+            intub_extub.select(["hospitalization_id", "extubation_time"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(pl.col("recorded_dttm") < pl.col("extubation_time"))
+        .sort(["hospitalization_id", "recorded_dttm"])
+        .group_by(["hospitalization_id", "vital_category"])
+        .last()
+        .select(["hospitalization_id", "vital_category", "vital_value"])
+        .pivot(
+            on="vital_category",
+            index="hospitalization_id",
+            values="vital_value",
+        )
+    )
+
+    # Ensure both columns exist even if no data for one category
+    if "height_cm" not in vitals_pre_extub.columns:
+        vitals_pre_extub = vitals_pre_extub.with_columns(pl.lit(None).cast(pl.Float64).alias("height_cm"))
+    if "weight_kg" not in vitals_pre_extub.columns:
+        vitals_pre_extub = vitals_pre_extub.with_columns(pl.lit(None).cast(pl.Float64).alias("weight_kg"))
+
+    vitals_pre_extub = vitals_pre_extub.select(["hospitalization_id", "height_cm", "weight_kg"])
+
+    print(f"Vitals pre-extubation: {len(vitals_pre_extub)} hospitalizations")
+    print(f"  height_cm non-null: {vitals_pre_extub['height_cm'].is_not_null().sum()}")
+    print(f"  weight_kg non-null: {vitals_pre_extub['weight_kg'].is_not_null().sum()}")
+    return (vitals_pre_extub,)
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    TIMEZONE,
+    compute_sofa_polars,
+    first_icu,
+    intub_extub,
+    pl,
+):
+    # Build cohort_df for SOFA at ICU admission (first 24h)
+    sofa_admission_cohort = (
+        intub_extub.select("hospitalization_id")
+        .join(first_icu.select(["hospitalization_id", "icu_start"]), on="hospitalization_id", how="inner")
+        .with_columns([
+            pl.col("icu_start").alias("start_dttm"),
+            (pl.col("icu_start") + pl.duration(hours=24)).alias("end_dttm"),
+        ])
+        .select(["hospitalization_id", "start_dttm", "end_dttm"])
+    )
+
+    sofa_admission = compute_sofa_polars(
+        data_directory=DATA_DIR,
+        cohort_df=sofa_admission_cohort,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+    ).select([
+        "hospitalization_id",
+        pl.col("sofa_total").alias("sofa_icu_admission"),
+    ])
+
+    # Build cohort_df for SOFA at extubation (24h before extubation)
+    sofa_extub_cohort = (
+        intub_extub.select(["hospitalization_id", "extubation_time"])
+        .with_columns([
+            (pl.col("extubation_time") - pl.duration(hours=24)).alias("start_dttm"),
+            pl.col("extubation_time").alias("end_dttm"),
+        ])
+        .select(["hospitalization_id", "start_dttm", "end_dttm"])
+    )
+
+    sofa_extubation = compute_sofa_polars(
+        data_directory=DATA_DIR,
+        cohort_df=sofa_extub_cohort,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+    ).select([
+        "hospitalization_id",
+        pl.col("sofa_total").alias("sofa_extubation"),
+    ])
+
+    # Combine into one DF
+    sofa_scores = (
+        sofa_admission
+        .join(sofa_extubation, on="hospitalization_id", how="outer_coalesce")
+    )
+
+    print(f"SOFA scores computed: {len(sofa_scores)} hospitalizations")
+    print(f"  sofa_icu_admission non-null: {sofa_scores['sofa_icu_admission'].is_not_null().sum()}")
+    print(f"  sofa_extubation non-null: {sofa_scores['sofa_extubation'].is_not_null().sum()}")
+    return (sofa_scores,)
+
+
+@app.cell
 def _(adt_df, first_icu, intub_extub, pl):
     # Step C3: Intubation/extubation location and pre-ICU trajectory
 
@@ -647,6 +765,10 @@ def _(adt_df, first_icu, intub_extub, pl):
 
 @app.cell
 def _(
+    DATA_DIR,
+    FILETYPE,
+    Patient,
+    TIMEZONE,
     code_status_pl,
     first_icu,
     hosp_df_filtered,
@@ -656,6 +778,8 @@ def _(
     pd,
     pl,
     resp_df,
+    sofa_scores,
+    vitals_pre_extub,
 ):
     # Step D: Build wide one-row-per-hospitalization dataset
     # Filter to rows with non-null extubation_time
@@ -666,6 +790,7 @@ def _(
         first_icu.select([
             "hospitalization_id", "icu_start", "icu_end",
             "readmission_to_icu", "readmission_icu_start", "hours_to_icu_readmission",
+            "icu_type", "icu_los_hours",
         ]),
         on="hospitalization_id",
         how="left",
@@ -683,6 +808,22 @@ def _(
         location_info,
         on="hospitalization_id",
         how="left",
+    )
+
+    # Left join vitals (height/weight) pre-extubation
+    wide = wide.join(
+        vitals_pre_extub,
+        on="hospitalization_id",
+        how="left",
+    )
+
+    # Left join SOFA scores
+    wide = wide.join(sofa_scores, on="hospitalization_id", how="left")
+
+    # Compute ICU LOS before extubation
+    wide = wide.with_columns(
+        ((pl.col("extubation_time") - pl.col("icu_start")).dt.total_seconds() / 3600)
+        .alias("icu_los_before_extubation_hours")
     )
 
     # Exclude hospitalizations where extubation did not occur in ICU
@@ -799,6 +940,13 @@ def _(
         "readmission_to_icu",
         "readmission_icu_start",
         "hours_to_icu_readmission",
+        "icu_type",
+        "icu_los_hours",
+        "icu_los_before_extubation_hours",
+        "height_cm",
+        "weight_kg",
+        "sofa_icu_admission",
+        "sofa_extubation",
     ])
 
     # Convert to pandas and merge with demographics from hosp_df_filtered
@@ -809,6 +957,37 @@ def _(
         on="hospitalization_id",
         how="inner",
     )
+
+    # Load Patient table for demographics + death_dttm
+    patient_table = Patient.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"patient_id": cohort["patient_id"].unique().tolist()},
+    )
+    patient_demo = patient_table.df[["patient_id", "sex_category", "race_category", "ethnicity_category", "death_dttm"]].copy()
+    patient_demo["death_dttm"] = pd.to_datetime(patient_demo["death_dttm"], errors="coerce")
+    if patient_demo["death_dttm"].dt.tz is not None:
+        patient_demo["death_dttm"] = patient_demo["death_dttm"].dt.tz_localize(None)
+    cohort = cohort.merge(patient_demo, on="patient_id", how="left")
+
+    # ICU mortality: death_dttm between icu_start and icu_end
+    cohort["icu_mortality"] = (
+        cohort["death_dttm"].notna()
+        & (cohort["death_dttm"] >= cohort["icu_start"])
+        & (cohort["death_dttm"] <= cohort["icu_end"])
+    )
+
+    # Hospital LOS in hours
+    cohort["hospital_los_hours"] = (
+        (cohort["discharge_dttm"] - cohort["admission_dttm"]).dt.total_seconds() / 3600
+    )
+
+    # Hospital mortality
+    cohort["hospital_mortality"] = cohort["discharge_category"] == "Expired"
+
+    # Drop helper column
+    cohort = cohort.drop(columns=["death_dttm"])
 
     print("\n=== FINAL COHORT ===")
     print(f"Total hospitalizations: {len(cohort)}")
