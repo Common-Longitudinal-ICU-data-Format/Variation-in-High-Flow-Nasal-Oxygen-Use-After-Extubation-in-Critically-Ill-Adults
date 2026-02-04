@@ -163,12 +163,30 @@ def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, hosp_df_filtered, pl, tqdm):
     # Sort by hospitalization_id and in_dttm
     adt_df = adt_df.sort(["hospitalization_id", "in_dttm"])
 
-    def merge_icu_procedural_icu(df: pl.DataFrame) -> pl.DataFrame:
-        """Merge ICU stays separated only by procedural visits."""
+    # Exclude ICU stays with null out_dttm
+    n_null_out = adt_df.filter(
+        (pl.col("location_category") == "icu") & pl.col("out_dttm").is_null()
+    ).height
+    adt_df = adt_df.filter(
+        ~((pl.col("location_category") == "icu") & pl.col("out_dttm").is_null())
+    )
+    print(f"Excluded {n_null_out} ICU ADT rows with null out_dttm")
+
+    # Recompute hosp_with_icu after removing null out_dttm ICU rows
+    hosp_with_icu = set(
+        adt_df.filter(pl.col("location_category") == "icu")["hospitalization_id"]
+        .unique().to_list()
+    )
+    n_excluded_null_out = n_with_icu - len(hosp_with_icu)
+    n_with_icu = len(hosp_with_icu)
+    print(f"Hospitalizations excluded (all ICU stays had null out_dttm): {n_excluded_null_out}")
+
+    def merge_icu_stays(df: pl.DataFrame) -> pl.DataFrame:
+        """Merge consecutive ICU stays (direct ICU→ICU or ICU→Procedural→ICU)."""
         merged_rows = []
         hosp_ids_unique = df["hospitalization_id"].unique().to_list()
 
-        for hosp_id in tqdm(hosp_ids_unique, desc="Merging ICU-procedural-ICU"):
+        for hosp_id in tqdm(hosp_ids_unique, desc="Merging consecutive ICU stays"):
             group = df.filter(pl.col("hospitalization_id") == hosp_id).sort("in_dttm")
             rows = group.to_dicts()
             i = 0
@@ -177,13 +195,18 @@ def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, hosp_df_filtered, pl, tqdm):
 
                 if row["location_category"] == "icu":
                     j = i + 1
-                    while j + 1 < len(rows):
+                    while j < len(rows):
                         next_row = rows[j]
-                        next_next_row = rows[j + 1]
 
-                        if (next_row["location_category"] == "procedural" and
-                            next_next_row["location_category"] == "icu"):
-                            row["out_dttm"] = next_next_row["out_dttm"]
+                        # Direct ICU → ICU transition
+                        if next_row["location_category"] == "icu":
+                            row["out_dttm"] = max(row["out_dttm"], next_row["out_dttm"])
+                            j += 1
+                        # ICU → Procedural → ICU transition
+                        elif (next_row["location_category"] == "procedural"
+                              and j + 1 < len(rows)
+                              and rows[j + 1]["location_category"] == "icu"):
+                            row["out_dttm"] = max(row["out_dttm"], rows[j + 1]["out_dttm"])
                             j += 2
                         else:
                             break
@@ -195,13 +218,20 @@ def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, hosp_df_filtered, pl, tqdm):
 
         return pl.DataFrame(merged_rows)
 
-    adt_df = merge_icu_procedural_icu(adt_df)
+    adt_df = merge_icu_stays(adt_df)
 
     icu_adt_df = adt_df.filter(pl.col("location_category") == "icu")
 
-    print(f"Total ADT records (after merging ICU-procedural-ICU): {len(adt_df)}")
+    print(f"Total ADT records (after merging consecutive ICU stays): {len(adt_df)}")
     print(f"ICU ADT records: {len(icu_adt_df)}")
-    return adt_df, hosp_with_icu, icu_adt_df, n_excluded_no_icu, n_with_icu
+    return (
+        adt_df,
+        hosp_with_icu,
+        icu_adt_df,
+        n_excluded_no_icu,
+        n_excluded_null_out,
+        n_with_icu,
+    )
 
 
 @app.cell
@@ -797,6 +827,7 @@ def _(
     n_excluded_no_resp,
     n_excluded_not_full_code,
     n_excluded_not_hfnc,
+    n_excluded_null_out,
     n_excluded_paco2,
     n_excluded_trach,
     n_no_extubation,
@@ -838,89 +869,96 @@ def _(
             {
                 "step": 3,
                 "description": "With ICU stay",
-                "n_remaining": n_with_icu,
+                "n_remaining": n_with_icu + n_excluded_null_out,
                 "n_excluded": n_excluded_no_icu,
                 "exclusion_reason": "No ICU stay",
             },
             {
                 "step": 4,
+                "description": "ICU stays with valid discharge time",
+                "n_remaining": n_with_icu,
+                "n_excluded": n_excluded_null_out,
+                "exclusion_reason": "All ICU stays had null out_dttm",
+            },
+            {
+                "step": 5,
                 "description": "With invasive mechanical ventilation",
                 "n_remaining": n_with_any_imv,
                 "n_excluded": n_excluded_no_imv,
                 "exclusion_reason": "No IMV",
             },
             {
-                "step": 5,
+                "step": 6,
                 "description": "No tracheostomy during hospitalization",
                 "n_remaining": n_with_imv_no_trach,
                 "n_excluded": n_excluded_trach,
                 "exclusion_reason": "Tracheostomy",
             },
             {
-                "step": 6,
+                "step": 7,
                 "description": "Respiratory data in ICU window",
                 "n_remaining": n_after_resp,
                 "n_excluded": n_excluded_no_resp,
                 "exclusion_reason": "No respiratory data before ICU end",
             },
             {
-                "step": 7,
+                "step": 8,
                 "description": "IMV before ICU end",
                 "n_remaining": n_after_imv_before_icu,
                 "n_excluded": n_excluded_no_imv_before_icu,
                 "exclusion_reason": "No IMV before ICU end",
             },
             {
-                "step": 8,
+                "step": 9,
                 "description": "Confirmed intubation detected",
                 "n_remaining": n_with_intubation,
                 "n_excluded": n_no_intubation,
                 "exclusion_reason": "No confirmed intubation",
             },
             {
-                "step": 9,
+                "step": 10,
                 "description": "Confirmed extubation detected",
                 "n_remaining": n_with_extubation,
                 "n_excluded": n_no_extubation,
                 "exclusion_reason": "No confirmed extubation",
             },
             {
-                "step": 10,
+                "step": 11,
                 "description": "Extubation occurred in ICU",
                 "n_remaining": n_after_extub_loc,
                 "n_excluded": n_excluded_extub_not_icu,
                 "exclusion_reason": "Extubation outside ICU",
             },
             {
-                "step": 11,
+                "step": 12,
                 "description": "No DNR/DNI/DNAR/AND code status at extubation",
                 "n_remaining": n_after_full_code,
                 "n_excluded": n_excluded_not_full_code,
                 "exclusion_reason": "DNR/DNI/DNAR/UDNR/AND code status at extubation",
             },
             {
-                "step": 12,
+                "step": 13,
                 "description": "PaCO2 <= 50 mmHg pre-extubation",
                 "n_remaining": n_after_paco2,
                 "n_excluded": n_excluded_paco2,
                 "exclusion_reason": "PaCO2 > 50 mmHg",
             },
             {
-                "step": 13,
+                "step": 14,
                 "description": "IMV duration >= 12 hours",
                 "n_remaining": n_after_imv_dur,
                 "n_excluded": n_excluded_imv_dur,
                 "exclusion_reason": "IMV duration < 12 hours",
             },
             {
-                "step": 14,
+                "step": 15,
                 "description": "Exclusive HFNC in first hour post-extubation",
                 "n_remaining": n_after_hfnc,
                 "n_excluded": n_excluded_not_hfnc,
                 "exclusion_reason": "Non-HFNC device in first hour post-extubation",
             },
             {
-                "step": 15,
+                "step": 16,
                 "description": "LPM >= 30 in first hour post-extubation",
                 "n_remaining": n_after_lpm,
                 "n_excluded": n_excluded_no_lpm,
@@ -943,19 +981,20 @@ def _(
         | 0 | Total hospitalizations | {n_total_hosp:,} | - | - |
         | 1 | Adults (age >= 18) | {n_total_hosp - n_excluded_age:,} | {n_excluded_age:,} | Age < 18 |
         | 2 | Study period (2018-2024) | {n_after_date:,} | {n_excluded_date:,} | Outside date range |
-        | 3 | With ICU stay | {n_with_icu:,} | {n_excluded_no_icu:,} | No ICU stay |
-        | 4 | With IMV | {n_with_any_imv:,} | {n_excluded_no_imv:,} | No IMV |
-        | 5 | No tracheostomy | {n_with_imv_no_trach:,} | {n_excluded_trach:,} | Tracheostomy |
-        | 6 | Resp data in ICU window | {n_after_resp:,} | {n_excluded_no_resp:,} | No resp data before ICU end |
-        | 7 | IMV before ICU end | {n_after_imv_before_icu:,} | {n_excluded_no_imv_before_icu:,} | No IMV before ICU end |
-        | 8 | Confirmed intubation | {n_with_intubation:,} | {n_no_intubation:,} | No confirmed intubation |
-        | 9 | Confirmed extubation | {n_with_extubation:,} | {n_no_extubation:,} | No confirmed extubation |
-        | 10 | Extubation in ICU | {n_after_extub_loc:,} | {n_excluded_extub_not_icu:,} | Extubation outside ICU |
-        | 11 | No DNR/DNI/DNAR/AND at extubation | {n_after_full_code:,} | {n_excluded_not_full_code:,} | DNR/DNI/DNAR/UDNR/AND code status at extubation |
-        | 12 | PaCO2 <= 50 mmHg | {n_after_paco2:,} | {n_excluded_paco2:,} | PaCO2 > 50 mmHg |
-        | 13 | IMV >= 12 hours | {n_after_imv_dur:,} | {n_excluded_imv_dur:,} | IMV < 12 hours |
-        | 14 | Exclusive HFNC (1h window) | {n_after_hfnc:,} | {n_excluded_not_hfnc:,} | Non-HFNC device in 1h window |
-        | 15 | LPM >= 30 (1h window) | {n_after_lpm:,} | {n_excluded_no_lpm:,} | No lpm_set >= 30 in 1h window |
+        | 3 | With ICU stay | {n_with_icu + n_excluded_null_out:,} | {n_excluded_no_icu:,} | No ICU stay |
+        | 4 | Valid ICU discharge time | {n_with_icu:,} | {n_excluded_null_out:,} | All ICU stays had null out_dttm |
+        | 5 | With IMV | {n_with_any_imv:,} | {n_excluded_no_imv:,} | No IMV |
+        | 6 | No tracheostomy | {n_with_imv_no_trach:,} | {n_excluded_trach:,} | Tracheostomy |
+        | 7 | Resp data in ICU window | {n_after_resp:,} | {n_excluded_no_resp:,} | No resp data before ICU end |
+        | 8 | IMV before ICU end | {n_after_imv_before_icu:,} | {n_excluded_no_imv_before_icu:,} | No IMV before ICU end |
+        | 9 | Confirmed intubation | {n_with_intubation:,} | {n_no_intubation:,} | No confirmed intubation |
+        | 10 | Confirmed extubation | {n_with_extubation:,} | {n_no_extubation:,} | No confirmed extubation |
+        | 11 | Extubation in ICU | {n_after_extub_loc:,} | {n_excluded_extub_not_icu:,} | Extubation outside ICU |
+        | 12 | No DNR/DNI/DNAR/AND at extubation | {n_after_full_code:,} | {n_excluded_not_full_code:,} | DNR/DNI/DNAR/UDNR/AND code status at extubation |
+        | 13 | PaCO2 <= 50 mmHg | {n_after_paco2:,} | {n_excluded_paco2:,} | PaCO2 > 50 mmHg |
+        | 14 | IMV >= 12 hours | {n_after_imv_dur:,} | {n_excluded_imv_dur:,} | IMV < 12 hours |
+        | 15 | Exclusive HFNC (1h window) | {n_after_hfnc:,} | {n_excluded_not_hfnc:,} | Non-HFNC device in 1h window |
+        | 16 | LPM >= 30 (1h window) | {n_after_lpm:,} | {n_excluded_no_lpm:,} | No lpm_set >= 30 in 1h window |
 
         **Final cohort: {len(cohort):,} hospitalizations, {cohort['patient_id'].nunique():,} unique patients**
         """
