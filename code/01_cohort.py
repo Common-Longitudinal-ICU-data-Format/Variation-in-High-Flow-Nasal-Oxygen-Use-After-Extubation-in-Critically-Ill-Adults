@@ -336,7 +336,32 @@ def _(icu_adt_df, pl, resp_df):
         .alias("icu_los_hours")
     )
 
+    # Find ICU readmissions: earliest ICU stay starting after the first ICU ended
+    readmissions = (
+        icu_filtered
+        .rename({"in_dttm": "readmission_icu_start", "out_dttm": "readmission_icu_end"})
+        .join(
+            first_icu.select(["hospitalization_id", "icu_end"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(pl.col("readmission_icu_start") > pl.col("icu_end"))
+        .sort(["hospitalization_id", "readmission_icu_start"])
+        .group_by("hospitalization_id")
+        .first()
+        .select(["hospitalization_id", "readmission_icu_start"])
+    )
+
+    first_icu = first_icu.join(readmissions, on="hospitalization_id", how="left")
+    first_icu = first_icu.with_columns([
+        pl.col("readmission_icu_start").is_not_null().alias("readmission_to_icu"),
+        ((pl.col("readmission_icu_start") - pl.col("icu_end")).dt.total_seconds() / 3600)
+        .alias("hours_to_icu_readmission"),
+    ])
+
+    n_readmit = first_icu.filter(pl.col("readmission_to_icu")).height
     print(f"First ICU stays (from IMV no-trach set): {len(first_icu)}")
+    print(f"ICU readmissions detected: {n_readmit} / {len(first_icu)}")
     return (first_icu,)
 
 
@@ -639,7 +664,8 @@ def _(
     # Join with first_icu for ICU timing columns
     wide = extub_valid.join(
         first_icu.select([
-            "hospitalization_id", "icu_start", "icu_end"
+            "hospitalization_id", "icu_start", "icu_end",
+            "readmission_to_icu", "readmission_icu_start", "hours_to_icu_readmission",
         ]),
         on="hospitalization_id",
         how="left",
@@ -770,6 +796,9 @@ def _(
         "extubation_location_category",
         "pre_icu_location_category",
         "pre_icu_trajectory",
+        "readmission_to_icu",
+        "readmission_icu_start",
+        "hours_to_icu_readmission",
     ])
 
     # Convert to pandas and merge with demographics from hosp_df_filtered
@@ -1157,11 +1186,6 @@ def _(
 @app.cell
 def _(cohort):
     cohort
-    return
-
-
-@app.cell
-def _():
     return
 
 
