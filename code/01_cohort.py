@@ -12,13 +12,14 @@ def _():
     import json
     from pathlib import Path
     from tqdm import tqdm
-    from clifpy.tables import Hospitalization, RespiratorySupport, Adt, CodeStatus, Labs
+    from clifpy.tables import Hospitalization, RespiratorySupport, Adt, CodeStatus, Labs, Patient
     return (
         Adt,
         CodeStatus,
         Hospitalization,
         Labs,
         Path,
+        Patient,
         RespiratorySupport,
         json,
         mo,
@@ -98,7 +99,7 @@ def _(DATA_DIR, FILETYPE, Hospitalization, SITE, TIMEZONE, pd):
 
 
 @app.cell
-def _(CodeStatus, DATA_DIR, FILETYPE, TIMEZONE, hosp_df, pd, pl):
+def _(CodeStatus, DATA_DIR, FILETYPE, TIMEZONE, hosp_df, pl):
     # Get patient IDs from hospitalizations
     patient_ids = hosp_df["patient_id"].unique().tolist()
 
@@ -119,60 +120,15 @@ def _(CodeStatus, DATA_DIR, FILETYPE, TIMEZONE, hosp_df, pd, pl):
         pl.col("code_status_category").str.to_lowercase().alias("code_status_lower")
     )
 
-    # Build hospitalizations Polars frame with timezone-naive datetimes
-    hosp_pl = pl.from_pandas(
-        hosp_df[["hospitalization_id", "patient_id", "admission_dttm", "discharge_dttm"]].assign(
-            admission_dttm=pd.to_datetime(hosp_df["admission_dttm"]).dt.tz_localize(None),
-            discharge_dttm=pd.to_datetime(hosp_df["discharge_dttm"]).dt.tz_localize(None),
-        )
-    )
+    print(f"Code status records loaded: {len(code_status_pl)}")
 
-    # Join code status to hospitalizations on patient_id using join_asof
-    # First sort both by patient_id + time for asof join isn't ideal here;
-    # instead use a cross-style join on patient_id then filter by time window
-    joined = code_status_pl.join(hosp_pl, on="patient_id", how="inner").filter(
-        (pl.col("start_dttm") >= pl.col("admission_dttm"))
-        & (pl.col("start_dttm") <= pl.col("discharge_dttm"))
-    )
-
-    # Categories to exclude (full code throughout)
-    exclude_categories = ["full", "presume full", "presume_full"]
-
-    # For each hospitalization: check if ALL records are full/presume full
-    hosp_code_summary = joined.group_by("hospitalization_id").agg(
-        pl.col("code_status_lower").is_in(exclude_categories).all().alias("all_full"),
-        pl.len().alias("n_records"),
-    )
-
-    hosp_to_exclude = set(
-        hosp_code_summary.filter(pl.col("all_full"))["hospitalization_id"].to_list()
-    )
-
-    # Filter hospitalizations
-    hosp_ids_after_code = set(hosp_df["hospitalization_id"].unique()) - hosp_to_exclude
-
-    n_excluded_full_code = len(hosp_to_exclude)
-    n_after_code_status = len(hosp_ids_after_code)
-
-    print(f"Hospitalizations with only Full/Presume Full code status (excluded): {n_excluded_full_code}")
-    print(f"After code status filter: {n_after_code_status}")
-
-    # Filter hosp_df to remaining hospitalizations
-    hosp_df_filtered = hosp_df[hosp_df["hospitalization_id"].isin(hosp_ids_after_code)].copy()
-    return hosp_df_filtered, n_after_code_status, n_excluded_full_code
+    # Pass through all hospitalizations (code status filter applied later, after extubation detection)
+    hosp_df_filtered = hosp_df.copy()
+    return code_status_pl, hosp_df_filtered
 
 
 @app.cell
-def _(
-    Adt,
-    DATA_DIR,
-    FILETYPE,
-    TIMEZONE,
-    hosp_df_filtered,
-    n_after_code_status,
-    pl,
-    tqdm,
-):
+def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, hosp_df_filtered, pl, tqdm):
     hosp_ids = hosp_df_filtered["hospitalization_id"].unique().tolist()
 
     adt = Adt.from_file(
@@ -198,7 +154,7 @@ def _(
         .to_list()
     )
     n_with_icu = len(hosp_with_icu)
-    n_excluded_no_icu = n_after_code_status - n_with_icu
+    n_excluded_no_icu = len(hosp_ids) - n_with_icu
     print(f"Hospitalizations with ICU stay: {n_with_icu} (excluded {n_excluded_no_icu} without ICU)")
 
     # Filter to only ICU hospitalizations for merge
@@ -399,55 +355,12 @@ def _(first_icu, pl, resp_df):
     print(f"Excluded {n_excluded_no_imv_before_icu} hospitalizations with no IMV before ICU end")
     print(f"Hospitalizations with IMV before ICU end: {n_after_imv_before_icu}")
     return (
-        ids_no_resp_data,
         n_after_imv_before_icu,
         n_after_resp,
         n_excluded_no_imv_before_icu,
         n_excluded_no_resp,
         resp_clipped,
     )
-
-
-@app.cell
-def _(resp_df):
-    resp_df
-    return
-
-
-@app.cell
-def _(adt_df):
-    adt_df
-    return
-
-
-@app.cell
-def _(ids_no_resp_data):
-    ids_no_resp_data
-    return
-
-
-@app.cell
-def _(intubations):
-    intubations
-    return
-
-
-@app.cell
-def _(resp_flagged):
-    resp_flagged
-    return
-
-
-@app.cell
-def _(resp_flagged):
-    resp_flagged
-    return
-
-
-@app.cell
-def _(ids_no_intubation):
-    ids_no_intubation
-    return
 
 
 @app.cell
@@ -477,6 +390,11 @@ def _(pl, resp_clipped):
         pl.col("is_imv").shift(-1).over("hospitalization_id").alias("lead1"),
         pl.col("is_imv").shift(-2).over("hospitalization_id").alias("lead2"),
     ])
+
+    # Add lead1_device: the device category of the next row (for post-extubation device)
+    resp_flagged = resp_flagged.with_columns(
+        pl.col("device_category").shift(-1).over("hospitalization_id").alias("lead1_device")
+    )
 
     # Intubation: is_imv==1, (lag1==0 or null), (lag2==0 or null)
     intubations = resp_flagged.filter(
@@ -525,7 +443,7 @@ def _(pl, resp_clipped):
             "hospitalization_id",
             "intubation_time",
             pl.col("recorded_dttm").alias("extubation_time"),
-            pl.col("device_category").alias("device_after_extubation"),
+            pl.col("lead1_device").alias("device_after_extubation"),
         ])
     )
 
@@ -540,21 +458,13 @@ def _(pl, resp_clipped):
     print(f"Hospitalizations with confirmed extubation: {n_with_extubation}")
     print(f"Hospitalizations without confirmed extubation: {n_no_extubation}")
     return (
-        ids_no_intubation,
+        first_intubation,
         intub_extub,
-        intubations,
         n_no_extubation,
         n_no_intubation,
         n_with_extubation,
         n_with_intubation,
-        resp_flagged,
     )
-
-
-@app.cell
-def _(intubations):
-    intubations
-    return
 
 
 @app.cell
@@ -682,6 +592,7 @@ def _(adt_df, first_icu, intub_extub, pl):
 
 @app.cell
 def _(
+    code_status_pl,
     first_icu,
     hosp_df_filtered,
     intub_extub,
@@ -689,6 +600,7 @@ def _(
     paco2_pre,
     pd,
     pl,
+    resp_df,
 ):
     # Step D: Build wide one-row-per-hospitalization dataset
     # Filter to rows with non-null extubation_time
@@ -724,6 +636,39 @@ def _(
     n_after_extub_loc = len(wide)
     print(f"After extubation-in-ICU filter: {n_after_extub_loc} (excluded {n_excluded_extub_not_icu} extubated outside ICU)")
 
+    # Full code status at extubation: last code status before extubation must be Full/Presume Full
+    hosp_patient_map = pl.from_pandas(
+        hosp_df_filtered[["hospitalization_id", "patient_id"]]
+    )
+
+    last_code_before_extub = (
+        code_status_pl
+        .join(hosp_patient_map, on="patient_id", how="inner")
+        .join(
+            wide.select(["hospitalization_id", "extubation_time"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(pl.col("start_dttm") <= pl.col("extubation_time"))
+        .sort(["hospitalization_id", "start_dttm"])
+        .group_by("hospitalization_id")
+        .last()
+        .select(["hospitalization_id", "code_status_lower"])
+    )
+
+    EXCLUDED_CODE_STATUSES = [
+        "dnr", "dnar", "udnr", "dnr/dni", "dnar/dni", "dni_only", "and",
+    ]
+    non_full_code_ids = last_code_before_extub.filter(
+        pl.col("code_status_lower").is_in(EXCLUDED_CODE_STATUSES)
+    )["hospitalization_id"]
+
+    n_before_code = len(wide)
+    wide = wide.filter(~pl.col("hospitalization_id").is_in(non_full_code_ids))
+    n_excluded_not_full_code = n_before_code - len(wide)
+    n_after_full_code = len(wide)
+    print(f"After code status exclusion: {n_after_full_code} (excluded {n_excluded_not_full_code} with DNR/DNI/DNAR/AND code status)")
+
     # Exclude hospitalizations with PaCO2 > 50 mmHg pre-extubation
     n_before_paco2 = len(wide)
     wide = wide.filter(
@@ -732,6 +677,53 @@ def _(
     n_excluded_paco2 = n_before_paco2 - len(wide)
     n_after_paco2 = len(wide)
     print(f"After PaCO2 <= 50 filter: {n_after_paco2} (excluded {n_excluded_paco2} with PaCO2 > 50)")
+
+    # Exclude hospitalizations with IMV duration < 12 hours
+    n_before_imv_dur = len(wide)
+    wide = wide.filter(pl.col("imv_duration_hours") >= 12)
+    n_excluded_imv_dur = n_before_imv_dur - len(wide)
+    n_after_imv_dur = len(wide)
+    print(f"After IMV duration >= 12h filter: {n_after_imv_dur} (excluded {n_excluded_imv_dur} with IMV < 12h)")
+
+    # 1-hour post-extubation window: only HFNC device + at least one lpm_set >= 30
+    window_resp = (
+        resp_df
+        .join(
+            wide.select(["hospitalization_id", "extubation_time"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(
+            (pl.col("recorded_dttm") > pl.col("extubation_time"))
+            & (pl.col("recorded_dttm") <= pl.col("extubation_time") + pl.duration(hours=1))
+        )
+    )
+
+    window_summary = (
+        window_resp
+        .group_by("hospitalization_id")
+        .agg([
+            pl.col("device_category").n_unique().alias("n_distinct_devices"),
+            (pl.col("device_category") == "high flow nc").all().alias("all_hfnc"),
+            ((pl.col("lpm_set").is_not_null()) & (pl.col("lpm_set") >= 30)).any().alias("has_lpm_gte_30"),
+        ])
+    )
+
+    # Step 14: Exclusive HFNC in first hour post-extubation
+    hfnc_only_ids = window_summary.filter(pl.col("all_hfnc"))["hospitalization_id"]
+    n_before_hfnc = len(wide)
+    wide = wide.filter(pl.col("hospitalization_id").is_in(hfnc_only_ids))
+    n_excluded_not_hfnc = n_before_hfnc - len(wide)
+    n_after_hfnc = len(wide)
+    print(f"After exclusive HFNC in 1h window: {n_after_hfnc} (excluded {n_excluded_not_hfnc} without exclusive HFNC)")
+
+    # Step 15: LPM >= 30 in first hour post-extubation
+    lpm_valid_ids = window_summary.filter(pl.col("all_hfnc") & pl.col("has_lpm_gte_30"))["hospitalization_id"]
+    n_before_lpm = len(wide)
+    wide = wide.filter(pl.col("hospitalization_id").is_in(lpm_valid_ids))
+    n_excluded_no_lpm = n_before_lpm - len(wide)
+    n_after_lpm = len(wide)
+    print(f"After LPM >= 30 in 1h window: {n_after_lpm} (excluded {n_excluded_no_lpm} without lpm_set >= 30)")
 
     wide = wide.select([
         "hospitalization_id",
@@ -766,8 +758,16 @@ def _(
     return (
         cohort,
         n_after_extub_loc,
+        n_after_full_code,
+        n_after_hfnc,
+        n_after_imv_dur,
+        n_after_lpm,
         n_after_paco2,
         n_excluded_extub_not_icu,
+        n_excluded_imv_dur,
+        n_excluded_no_lpm,
+        n_excluded_not_full_code,
+        n_excluded_not_hfnc,
         n_excluded_paco2,
     )
 
@@ -777,20 +777,26 @@ def _(
     SITE,
     cohort,
     mo,
-    n_after_code_status,
     n_after_date,
     n_after_extub_loc,
+    n_after_full_code,
+    n_after_hfnc,
     n_after_imv_before_icu,
+    n_after_imv_dur,
+    n_after_lpm,
     n_after_paco2,
     n_after_resp,
     n_excluded_age,
     n_excluded_date,
     n_excluded_extub_not_icu,
-    n_excluded_full_code,
+    n_excluded_imv_dur,
     n_excluded_no_icu,
     n_excluded_no_imv,
     n_excluded_no_imv_before_icu,
+    n_excluded_no_lpm,
     n_excluded_no_resp,
+    n_excluded_not_full_code,
+    n_excluded_not_hfnc,
     n_excluded_paco2,
     n_excluded_trach,
     n_no_extubation,
@@ -831,66 +837,66 @@ def _(
             },
             {
                 "step": 3,
-                "description": "Non-Full code status during hospitalization",
-                "n_remaining": n_after_code_status,
-                "n_excluded": n_excluded_full_code,
-                "exclusion_reason": "Full/Presume Full code status throughout",
-            },
-            {
-                "step": 4,
                 "description": "With ICU stay",
                 "n_remaining": n_with_icu,
                 "n_excluded": n_excluded_no_icu,
                 "exclusion_reason": "No ICU stay",
             },
             {
-                "step": 5,
+                "step": 4,
                 "description": "With invasive mechanical ventilation",
                 "n_remaining": n_with_any_imv,
                 "n_excluded": n_excluded_no_imv,
                 "exclusion_reason": "No IMV",
             },
             {
-                "step": 6,
+                "step": 5,
                 "description": "No tracheostomy during hospitalization",
                 "n_remaining": n_with_imv_no_trach,
                 "n_excluded": n_excluded_trach,
                 "exclusion_reason": "Tracheostomy",
             },
             {
-                "step": 7,
+                "step": 6,
                 "description": "Respiratory data in ICU window",
                 "n_remaining": n_after_resp,
                 "n_excluded": n_excluded_no_resp,
                 "exclusion_reason": "No respiratory data before ICU end",
             },
             {
-                "step": 8,
+                "step": 7,
                 "description": "IMV before ICU end",
                 "n_remaining": n_after_imv_before_icu,
                 "n_excluded": n_excluded_no_imv_before_icu,
                 "exclusion_reason": "No IMV before ICU end",
             },
             {
-                "step": 9,
+                "step": 8,
                 "description": "Confirmed intubation detected",
                 "n_remaining": n_with_intubation,
                 "n_excluded": n_no_intubation,
                 "exclusion_reason": "No confirmed intubation",
             },
             {
-                "step": 10,
+                "step": 9,
                 "description": "Confirmed extubation detected",
                 "n_remaining": n_with_extubation,
                 "n_excluded": n_no_extubation,
                 "exclusion_reason": "No confirmed extubation",
             },
             {
-                "step": 11,
+                "step": 10,
                 "description": "Extubation occurred in ICU",
                 "n_remaining": n_after_extub_loc,
                 "n_excluded": n_excluded_extub_not_icu,
                 "exclusion_reason": "Extubation outside ICU",
+            },
+            {
+                "step": 11,
+                "description": "No DNR/DNI/DNAR/AND code status at extubation",
+                "n_remaining": n_after_full_code,
+                "n_excluded": n_excluded_not_full_code,
+                "exclusion_reason": "DNR/DNI/DNAR/UDNR/AND code status at extubation",
             },
             {
                 "step": 12,
@@ -898,6 +904,27 @@ def _(
                 "n_remaining": n_after_paco2,
                 "n_excluded": n_excluded_paco2,
                 "exclusion_reason": "PaCO2 > 50 mmHg",
+            },
+            {
+                "step": 13,
+                "description": "IMV duration >= 12 hours",
+                "n_remaining": n_after_imv_dur,
+                "n_excluded": n_excluded_imv_dur,
+                "exclusion_reason": "IMV duration < 12 hours",
+            },
+            {
+                "step": 14,
+                "description": "Exclusive HFNC in first hour post-extubation",
+                "n_remaining": n_after_hfnc,
+                "n_excluded": n_excluded_not_hfnc,
+                "exclusion_reason": "Non-HFNC device in first hour post-extubation",
+            },
+            {
+                "step": 15,
+                "description": "LPM >= 30 in first hour post-extubation",
+                "n_remaining": n_after_lpm,
+                "n_excluded": n_excluded_no_lpm,
+                "exclusion_reason": "No lpm_set >= 30 in first hour post-extubation",
             },
         ],
         "final_cohort": {
@@ -916,16 +943,19 @@ def _(
         | 0 | Total hospitalizations | {n_total_hosp:,} | - | - |
         | 1 | Adults (age >= 18) | {n_total_hosp - n_excluded_age:,} | {n_excluded_age:,} | Age < 18 |
         | 2 | Study period (2018-2024) | {n_after_date:,} | {n_excluded_date:,} | Outside date range |
-        | 3 | Non-Full code status | {n_after_code_status:,} | {n_excluded_full_code:,} | Full/Presume Full code throughout |
-        | 4 | With ICU stay | {n_with_icu:,} | {n_excluded_no_icu:,} | No ICU stay |
-        | 5 | With IMV | {n_with_any_imv:,} | {n_excluded_no_imv:,} | No IMV |
-        | 6 | No tracheostomy | {n_with_imv_no_trach:,} | {n_excluded_trach:,} | Tracheostomy |
-        | 7 | Resp data in ICU window | {n_after_resp:,} | {n_excluded_no_resp:,} | No resp data before ICU end |
-        | 8 | IMV before ICU end | {n_after_imv_before_icu:,} | {n_excluded_no_imv_before_icu:,} | No IMV before ICU end |
-        | 9 | Confirmed intubation | {n_with_intubation:,} | {n_no_intubation:,} | No confirmed intubation |
-        | 10 | Confirmed extubation | {n_with_extubation:,} | {n_no_extubation:,} | No confirmed extubation |
-        | 11 | Extubation in ICU | {n_after_extub_loc:,} | {n_excluded_extub_not_icu:,} | Extubation outside ICU |
+        | 3 | With ICU stay | {n_with_icu:,} | {n_excluded_no_icu:,} | No ICU stay |
+        | 4 | With IMV | {n_with_any_imv:,} | {n_excluded_no_imv:,} | No IMV |
+        | 5 | No tracheostomy | {n_with_imv_no_trach:,} | {n_excluded_trach:,} | Tracheostomy |
+        | 6 | Resp data in ICU window | {n_after_resp:,} | {n_excluded_no_resp:,} | No resp data before ICU end |
+        | 7 | IMV before ICU end | {n_after_imv_before_icu:,} | {n_excluded_no_imv_before_icu:,} | No IMV before ICU end |
+        | 8 | Confirmed intubation | {n_with_intubation:,} | {n_no_intubation:,} | No confirmed intubation |
+        | 9 | Confirmed extubation | {n_with_extubation:,} | {n_no_extubation:,} | No confirmed extubation |
+        | 10 | Extubation in ICU | {n_after_extub_loc:,} | {n_excluded_extub_not_icu:,} | Extubation outside ICU |
+        | 11 | No DNR/DNI/DNAR/AND at extubation | {n_after_full_code:,} | {n_excluded_not_full_code:,} | DNR/DNI/DNAR/UDNR/AND code status at extubation |
         | 12 | PaCO2 <= 50 mmHg | {n_after_paco2:,} | {n_excluded_paco2:,} | PaCO2 > 50 mmHg |
+        | 13 | IMV >= 12 hours | {n_after_imv_dur:,} | {n_excluded_imv_dur:,} | IMV < 12 hours |
+        | 14 | Exclusive HFNC (1h window) | {n_after_hfnc:,} | {n_excluded_not_hfnc:,} | Non-HFNC device in 1h window |
+        | 15 | LPM >= 30 (1h window) | {n_after_lpm:,} | {n_excluded_no_lpm:,} | No lpm_set >= 30 in 1h window |
 
         **Final cohort: {len(cohort):,} hospitalizations, {cohort['patient_id'].nunique():,} unique patients**
         """
@@ -954,7 +984,134 @@ def _(Path, cohort, consort_flow, json):
     print(f"CONSORT flow saved to: {consort_path}")
 
     print(f"\nCohort columns: {cohort.columns.tolist()}")
-    cohort
+    return
+
+
+@app.cell
+def _(Path, intub_extub, pl):
+    # Sub-analysis 1: Device distribution after extubation
+    _device_counts = (
+        intub_extub
+        .group_by("device_after_extubation")
+        .len()
+        .rename({"len": "n"})
+        .sort("n", descending=True)
+    )
+    _total = _device_counts["n"].sum()
+    _device_counts = _device_counts.with_columns(
+        (pl.col("n") / _total * 100).round(1).alias("percent")
+    )
+
+    _device_counts_pd = _device_counts.to_pandas()
+    _output_dir = Path(__file__).parent.parent / "output_to_share"
+    _device_counts_pd.to_csv(
+        _output_dir / "subanalysis_device_after_extubation.csv", index=False
+    )
+    print("Sub-analysis 1: Device after extubation")
+    print(_device_counts_pd.to_string(index=False))
+    return
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    Path,
+    Patient,
+    TIMEZONE,
+    adt_df,
+    first_icu,
+    first_intubation,
+    hosp_df_filtered,
+    intub_extub,
+    pd,
+    pl,
+):
+    # Sub-analysis 2: Why extubation was not found
+    _no_extub_ids = (
+        first_intubation
+        .filter(~pl.col("hospitalization_id").is_in(intub_extub["hospitalization_id"]))
+        ["hospitalization_id"]
+        .to_list()
+    )
+    print(f"Hospitalizations with intubation but no extubation: {len(_no_extub_ids)}")
+
+    # Get patient_ids for these hospitalizations
+    _no_extub_hosp = hosp_df_filtered[
+        hosp_df_filtered["hospitalization_id"].isin(_no_extub_ids)
+    ][["hospitalization_id", "patient_id", "discharge_dttm", "discharge_category"]].copy()
+    _patient_ids = _no_extub_hosp["patient_id"].unique().tolist()
+
+    # Load Patient table for death_dttm
+    _patient_table = Patient.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"patient_id": _patient_ids},
+    )
+    _patient_pd = _patient_table.df[["patient_id", "death_dttm"]].copy()
+    _patient_pd["death_dttm"] = pd.to_datetime(_patient_pd["death_dttm"], errors="coerce")
+    _patient_pd["death_dttm"] = _patient_pd["death_dttm"].dt.tz_localize(None)
+
+    # Merge death info
+    _no_extub_hosp = _no_extub_hosp.merge(_patient_pd, on="patient_id", how="left")
+
+    # Get ICU end times
+    _icu_info = first_icu.select(["hospitalization_id", "icu_end"]).to_pandas()
+    _no_extub_hosp = _no_extub_hosp.merge(_icu_info, on="hospitalization_id", how="left")
+
+    # Get next location after ICU (from adt_df)
+    _no_extub_adt = (
+        adt_df
+        .filter(pl.col("hospitalization_id").is_in(_no_extub_ids))
+        .join(
+            first_icu.select(["hospitalization_id", "icu_end"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(pl.col("in_dttm") >= pl.col("icu_end"))
+        .filter(pl.col("location_category") != "icu")
+        .sort(["hospitalization_id", "in_dttm"])
+        .group_by("hospitalization_id")
+        .first()
+        .select(["hospitalization_id", pl.col("location_category").alias("next_location_after_icu")])
+        .to_pandas()
+    )
+    _no_extub_hosp = _no_extub_hosp.merge(_no_extub_adt, on="hospitalization_id", how="left")
+
+    # Classify reason
+    def _classify_reason(row):
+        # Check death in ICU (death_dttm <= icu_end)
+        if pd.notna(row.get("death_dttm")) and pd.notna(row.get("icu_end")):
+            if row["death_dttm"] <= row["icu_end"]:
+                return "Died in ICU"
+        if row.get("discharge_category") == "Expired" and pd.isna(row.get("next_location_after_icu")):
+            return "Died in ICU"
+        # Check transferred from ICU to another location
+        if pd.notna(row.get("next_location_after_icu")):
+            return f"Transferred from ICU (to {row['next_location_after_icu']})"
+        # Check discharged from hospital
+        if pd.notna(row.get("discharge_dttm")):
+            return f"Discharged from hospital ({row.get('discharge_category', 'unknown')})"
+        return "Unknown/Other"
+
+    _no_extub_hosp["reason"] = _no_extub_hosp.apply(_classify_reason, axis=1)
+
+    # Aggregate
+    _reason_counts = (
+        _no_extub_hosp.groupby("reason")
+        .size()
+        .reset_index(name="n")
+        .sort_values("n", ascending=False)
+    )
+    _reason_counts["percent"] = (_reason_counts["n"] / _reason_counts["n"].sum() * 100).round(1)
+
+    _output_dir = Path(__file__).parent.parent / "output_to_share"
+    _reason_counts.to_csv(
+        _output_dir / "subanalysis_no_extubation_reasons.csv", index=False
+    )
+    print("\nSub-analysis 2: Reasons extubation not found")
+    print(_reason_counts.to_string(index=False))
     return
 
 
