@@ -814,60 +814,62 @@ def _(Path, panel):
 
 
 @app.cell
-def _(panel, plt):
-    # HFNO Flow Over Time Since Extubation
-    _flow_df = (
-        panel.select(["window_idx", "hfno_flow_rate"])
-        .drop_nulls(subset=["hfno_flow_rate"])
-        .to_pandas()
+def _(panel, pl, plt):
+    _raw = panel.select(["window_idx", "hfno_flow_rate"]).drop_nulls()
+    _agg = (
+        _raw
+        .group_by("window_idx")
+        .agg(pl.col("hfno_flow_rate").mean())
+        .sort("window_idx")
     )
-
-    _fig, _ax = plt.subplots(figsize=(12, 6))
-
-    # Mean line per window
-    _mean_flow = _flow_df.groupby("window_idx")["hfno_flow_rate"].mean().reset_index()
-    _ax.plot(
-        _mean_flow["window_idx"] * 4 / 24,
-        _mean_flow["hfno_flow_rate"],
-        color="tab:blue",
+    plt.figure(figsize=(12, 6))
+    plt.scatter(
+        (_raw["window_idx"] * 4 / 24).to_list(),
+        _raw["hfno_flow_rate"].to_list(),
+        alpha=0.15,
+        s=8,
+        label="Individual",
+    )
+    plt.plot(
+        (_agg["window_idx"] * 4 / 24).to_list(),
+        _agg["hfno_flow_rate"].to_list(),
         lw=2.5,
         label="Mean",
     )
-
-    _ax.set_title("HFNO Flow Over Time Since Extubation")
-    _ax.set_xlabel("Days Since Extubation")
-    _ax.set_ylabel("HFNO Flow (L/min)")
-    _ax.legend()
-    flow_plot = _fig
+    plt.title("HFNO Flow Over Time Since Extubation")
+    plt.xlabel("Days Since Extubation")
+    plt.ylabel("HFNO Flow (L/min)")
+    plt.legend()
     return
 
 
 @app.cell
-def _(panel, plt):
-    # FiO2 Levels Over Time
-    _fio2_df = (
-        panel.select(["window_idx", "hfno_fio2"])
-        .drop_nulls(subset=["hfno_fio2"])
-        .to_pandas()
+def _(panel, pl, plt):
+    _raw = panel.select(["window_idx", "hfno_fio2"]).drop_nulls()
+    _agg = (
+        _raw
+        .group_by("window_idx")
+        .agg(pl.col("hfno_fio2").mean())
+        .sort("window_idx")
     )
-
-    _fig2, _ax2 = plt.subplots(figsize=(12, 6))
-
-    # Mean line per window
-    _mean_fio2 = _fio2_df.groupby("window_idx")["hfno_fio2"].mean().reset_index()
-    _ax2.plot(
-        _mean_fio2["window_idx"] * 4,
-        _mean_fio2["hfno_fio2"] * 100,
-        color="tab:blue",
+    plt.figure(figsize=(12, 6))
+    plt.scatter(
+        (_raw["window_idx"] * 4).to_list(),
+        (_raw["hfno_fio2"] * 100).to_list(),
+        alpha=0.15,
+        s=8,
+        label="Individual",
+    )
+    plt.plot(
+        (_agg["window_idx"] * 4).to_list(),
+        (_agg["hfno_fio2"] * 100).to_list(),
         lw=2.5,
         label="Mean",
     )
-
-    _ax2.set_title("FiO2 Levels Over Time (0 to 168 Hours)")
-    _ax2.set_xlabel("Time (hours)")
-    _ax2.set_ylabel("FiO2 (%)")
-    _ax2.legend()
-    fio2_plot = _fig2
+    plt.title("FiO2 Levels Over Time (0 to 168 Hours)")
+    plt.xlabel("Time (hours)")
+    plt.ylabel("FiO2 (%)")
+    plt.legend()
     return
 
 

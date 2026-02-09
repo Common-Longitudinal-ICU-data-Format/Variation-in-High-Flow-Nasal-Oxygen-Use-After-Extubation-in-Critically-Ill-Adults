@@ -1,2 +1,6 @@
 *.log
 *.pyc
+__marimo__/
+output/
+output_to_share/
+clif_config.json
