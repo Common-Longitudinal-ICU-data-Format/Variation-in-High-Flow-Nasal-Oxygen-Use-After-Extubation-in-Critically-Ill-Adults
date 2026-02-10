@@ -26,6 +26,11 @@ def _(mo):
       All non-IMV respiratory devices (HFNC, NIPPV, CPAP, nasal cannula, etc.) are allowed.
     - **`extubation_success_strict_7d`** = alive + no reintubation + **no NIPPV/CPAP** within 7 days.
       Only HFNC, nasal cannula, and room air are allowed.
+    - **`definitive_hfno_weaning`** = patient transitioned from HFNO to low-support device
+      (room air, nasal cannula, face mask), sustained >48 hours with no relapse, no escalation
+      to NIPPV/CPAP/IMV, and alive at Day 7.
+    - **`time_to_hfno_weaning_hours`** = hours from first HFNO after extubation to first sustained
+      transition to low-support device. Null if not definitively weaned.
     """)
     return
 
@@ -238,9 +243,116 @@ def _(cohort, death_by_hosp, pl):
 
 
 @app.cell
+def _(cohort, death_by_hosp, pl, resp):
+    WEANED_DEVICES = ["room air", "nasal cannula", "face mask"]
+    ESCALATION_DEVICES = ["nippv", "cpap", "imv"]
+
+    # All post-extubation records within 7-day window
+    post_ext = resp.join(
+        cohort.select(["hospitalization_id", "extubation_time", "window_end_7d"]),
+        on="hospitalization_id",
+        how="inner",
+    ).filter(
+        (pl.col("recorded_dttm") > pl.col("extubation_time"))
+        & (pl.col("recorded_dttm") <= pl.col("window_end_7d"))
+    )
+
+    # First and last HFNO times per patient
+    hfno_times = (
+        post_ext.filter(pl.col("device_category") == "high flow nc")
+        .group_by("hospitalization_id")
+        .agg([
+            pl.col("recorded_dttm").min().alias("first_hfno_time"),
+            pl.col("recorded_dttm").max().alias("last_hfno_time"),
+        ])
+    )
+
+    # Any escalation (NIPPV/CPAP/IMV) post-extubation
+    has_escalation = (
+        post_ext.filter(pl.col("device_category").is_in(ESCALATION_DEVICES))
+        .select("hospitalization_id").unique()
+        .with_columns(pl.lit(True).alias("has_escalation"))
+    )
+
+    # First weaned-device record AFTER last HFNO
+    weaning_start = (
+        post_ext.filter(pl.col("device_category").is_in(WEANED_DEVICES))
+        .join(hfno_times.select(["hospitalization_id", "last_hfno_time"]),
+              on="hospitalization_id", how="inner")
+        .filter(pl.col("recorded_dttm") > pl.col("last_hfno_time"))
+        .group_by("hospitalization_id")
+        .agg(pl.col("recorded_dttm").min().alias("weaning_start_time"))
+    )
+
+    # Check no non-weaned records in (weaning_start_time, weaning_start_time + 48h]
+    non_weaned_after_wean = (
+        post_ext.filter(~pl.col("device_category").is_in(WEANED_DEVICES))
+        .join(weaning_start, on="hospitalization_id", how="inner")
+        .filter(
+            (pl.col("recorded_dttm") > pl.col("weaning_start_time"))
+            & (pl.col("recorded_dttm") <= (pl.col("weaning_start_time") + pl.duration(hours=48)))
+        )
+        .select("hospitalization_id").unique()
+        .with_columns(pl.lit(True).alias("relapse_in_48h"))
+    )
+
+    # Alive at Day 7
+    alive_7d = (
+        cohort.select(["hospitalization_id", "patient_id", "extubation_time", "window_end_7d"])
+        .join(death_by_hosp, on="hospitalization_id", how="left")
+        .with_columns(
+            (pl.col("death_dttm").is_null()
+             | (pl.col("death_dttm") > pl.col("window_end_7d"))
+            ).alias("alive_at_7d")
+        )
+        .select(["hospitalization_id", "alive_at_7d"])
+    )
+
+    # Assemble per HFNO patient
+    hfno_weaning = (
+        hfno_times
+        .join(weaning_start, on="hospitalization_id", how="left")
+        .join(has_escalation, on="hospitalization_id", how="left")
+        .join(non_weaned_after_wean, on="hospitalization_id", how="left")
+        .join(alive_7d, on="hospitalization_id", how="left")
+        .join(
+            cohort.select(["hospitalization_id", "window_end_7d"]),
+            on="hospitalization_id", how="left",
+        )
+        .with_columns([
+            pl.col("has_escalation").fill_null(False),
+            pl.col("relapse_in_48h").fill_null(False),
+        ])
+        .with_columns(
+            (
+                pl.col("alive_at_7d")
+                & ~pl.col("has_escalation")
+                & ~pl.col("relapse_in_48h")
+                & pl.col("weaning_start_time").is_not_null()
+                & ((pl.col("window_end_7d") - pl.col("weaning_start_time")).dt.total_hours() > 48)
+            ).alias("definitive_hfno_weaning")
+        )
+        .with_columns(
+            pl.when(pl.col("definitive_hfno_weaning"))
+            .then((pl.col("weaning_start_time") - pl.col("first_hfno_time")).dt.total_hours())
+            .otherwise(None)
+            .alias("time_to_hfno_weaning_hours")
+        )
+        .select(["hospitalization_id", "definitive_hfno_weaning", "time_to_hfno_weaning_hours"])
+    )
+
+    n_hfno = len(hfno_weaning)
+    n_weaned = hfno_weaning["definitive_hfno_weaning"].sum()
+    print(f"HFNO patients: {n_hfno}")
+    print(f"Definitive HFNO weaning: {n_weaned}/{n_hfno} ({n_weaned / n_hfno * 100:.1f}%)")
+    return (hfno_weaning,)
+
+
+@app.cell
 def _(
     cohort,
     death_flag,
+    hfno_weaning,
     nippv_cpap_flag,
     nippv_cpap_icu_flag,
     pl,
@@ -253,11 +365,13 @@ def _(
         .join(death_flag, on="hospitalization_id", how="left")
         .join(nippv_cpap_flag, on="hospitalization_id", how="left")
         .join(nippv_cpap_icu_flag, on="hospitalization_id", how="left")
+        .join(hfno_weaning, on="hospitalization_id", how="left")
         .with_columns([
             pl.col("reintubation_in_7d").fill_null(False),
             pl.col("death_in_7d").fill_null(False),
             pl.col("nippv_cpap_in_7d").fill_null(False),
             pl.col("nippv_cpap_in_7d_plus_in_ICU").fill_null(False),
+            pl.col("definitive_hfno_weaning").fill_null(False),
         ])
         .with_columns([
             (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d")).alias("extubation_success_7d"),
@@ -272,6 +386,8 @@ def _(
     n_nippv_cpap_icu = result["nippv_cpap_in_7d_plus_in_ICU"].sum()
     n_success = result["extubation_success_7d"].sum()
     n_success_strict = result["extubation_success_strict_7d"].sum()
+    n_hfno_weaned = result["definitive_hfno_weaning"].sum()
+    n_hfno_weaned_with_time = result["time_to_hfno_weaning_hours"].is_not_null().sum()
 
     print("=== Column Descriptions ===")
     print(f"  window_end_7d: End of 7-day observation window (extubation_time + 168h)")
@@ -287,7 +403,23 @@ def _(
     print(f"    -> {n_success}/{N} ({n_success / N * 100:.1f}%)")
     print(f"  extubation_success_strict_7d: Alive + no reintubation + no NIPPV/CPAP within 7 days")
     print(f"    -> {n_success_strict}/{N} ({n_success_strict / N * 100:.1f}%)")
+    print(f"  definitive_hfno_weaning: Sustained weaning from HFNO >48h, no escalation, alive at 7d")
+    print(f"    -> {n_hfno_weaned}/{N} ({n_hfno_weaned / N * 100:.1f}%)")
+    print(f"  time_to_hfno_weaning_hours: Hours from first HFNO to sustained low-support transition")
+    print(f"    -> {n_hfno_weaned_with_time} patients with non-null values")
     return (result,)
+
+
+@app.cell
+def _(result):
+    result['time_to_hfno_weaning_hours'].median()
+    return
+
+
+@app.cell
+def _(result):
+    result['time_to_hfno_weaning_hours'].mean()
+    return
 
 
 @app.cell
