@@ -882,6 +882,9 @@ def _(
     n_after_imv_dur = len(wide)
     print(f"After IMV duration >= 12h filter: {n_after_imv_dur} (excluded {n_excluded_imv_dur} with IMV < 12h)")
 
+    # === Snapshot after Step 14: all clinically eligible extubated patients ===
+    wide_eligible = wide.clone()
+
     # 1-hour post-extubation window: only HFNC device + at least one lpm_set >= 30
     window_resp = (
         resp_df
@@ -922,7 +925,13 @@ def _(
     n_after_lpm = len(wide)
     print(f"After LPM >= 30 in 1h window: {n_after_lpm} (excluded {n_excluded_no_lpm} without lpm_set >= 30)")
 
-    wide = wide.select([
+    # === Derive no-HFNO group: eligible patients who did NOT pass Steps 15-16 ===
+    hfno_ids = set(wide["hospitalization_id"].to_list())
+    no_hfno_wide = wide_eligible.filter(~pl.col("hospitalization_id").is_in(hfno_ids))
+    print(f"\nNo-HFNO group (eligible but failed Steps 15-16): {len(no_hfno_wide)}")
+
+    # Same column selection for both groups
+    _keep_cols = [
         "hospitalization_id",
         "icu_start",
         "icu_end",
@@ -947,54 +956,68 @@ def _(
         "weight_kg",
         "sofa_icu_admission",
         "sofa_extubation",
-    ])
+    ]
 
-    # Convert to pandas and merge with demographics from hosp_df_filtered
-    wide_pd = wide.to_pandas()
-    cohort = pd.merge(
-        hosp_df_filtered[['patient_id', 'hospitalization_id', 'admission_dttm', 'discharge_dttm','age_at_admission','discharge_category']],
-        wide_pd,
-        on="hospitalization_id",
-        how="inner",
-    )
+    wide = wide.select(_keep_cols)
+    no_hfno_wide = no_hfno_wide.select(_keep_cols)
 
-    # Load Patient table for demographics + death_dttm
+    # Helper function: merge demographics onto a wide DataFrame
+    def _merge_demographics(wide_df):
+        wide_pd_ = wide_df.to_pandas()
+        merged = pd.merge(
+            hosp_df_filtered[['patient_id', 'hospitalization_id', 'admission_dttm', 'discharge_dttm','age_at_admission','discharge_category']],
+            wide_pd_,
+            on="hospitalization_id",
+            how="inner",
+        )
+        return merged
+
+    # Load Patient table for demographics + death_dttm (need all patient_ids from both groups)
+    all_wide_ids = set(wide.to_pandas()["hospitalization_id"].tolist()) | set(no_hfno_wide.to_pandas()["hospitalization_id"].tolist())
+    all_patient_ids = hosp_df_filtered[hosp_df_filtered["hospitalization_id"].isin(all_wide_ids)]["patient_id"].unique().tolist()
+
     patient_table = Patient.from_file(
         data_directory=DATA_DIR,
         filetype=FILETYPE,
         timezone=TIMEZONE,
-        filters={"patient_id": cohort["patient_id"].unique().tolist()},
+        filters={"patient_id": all_patient_ids},
     )
     patient_demo = patient_table.df[["patient_id", "sex_category", "race_category", "ethnicity_category", "death_dttm"]].copy()
     patient_demo["death_dttm"] = pd.to_datetime(patient_demo["death_dttm"], errors="coerce")
     if patient_demo["death_dttm"].dt.tz is not None:
         patient_demo["death_dttm"] = patient_demo["death_dttm"].dt.tz_localize(None)
-    cohort = cohort.merge(patient_demo, on="patient_id", how="left")
 
-    # ICU mortality: death_dttm between icu_start and icu_end
-    cohort["icu_mortality"] = (
-        cohort["death_dttm"].notna()
-        & (cohort["death_dttm"] >= cohort["icu_start"])
-        & (cohort["death_dttm"] <= cohort["icu_end"])
-    )
+    def _add_derived_columns(df):
+        df = df.merge(patient_demo, on="patient_id", how="left")
+        df["icu_mortality"] = (
+            df["death_dttm"].notna()
+            & (df["death_dttm"] >= df["icu_start"])
+            & (df["death_dttm"] <= df["icu_end"])
+        )
+        df["hospital_los_hours"] = (
+            (df["discharge_dttm"] - df["admission_dttm"]).dt.total_seconds() / 3600
+        )
+        df["hospital_mortality"] = df["discharge_category"] == "Expired"
+        df = df.drop(columns=["death_dttm"])
+        return df
 
-    # Hospital LOS in hours
-    cohort["hospital_los_hours"] = (
-        (cohort["discharge_dttm"] - cohort["admission_dttm"]).dt.total_seconds() / 3600
-    )
+    # Process HFNO cohort
+    cohort = _add_derived_columns(_merge_demographics(wide))
 
-    # Hospital mortality
-    cohort["hospital_mortality"] = cohort["discharge_category"] == "Expired"
+    # Process no-HFNO cohort
+    cohort_no_hfno = _add_derived_columns(_merge_demographics(no_hfno_wide))
 
-    # Drop helper column
-    cohort = cohort.drop(columns=["death_dttm"])
-
-    print("\n=== FINAL COHORT ===")
+    print("\n=== FINAL HFNO COHORT ===")
     print(f"Total hospitalizations: {len(cohort)}")
     print(f"Unique patients: {cohort['patient_id'].nunique()}")
     print(f"Columns: {cohort.columns.tolist()}")
+
+    print(f"\n=== NO-HFNO COHORT ===")
+    print(f"Total hospitalizations: {len(cohort_no_hfno)}")
+    print(f"Unique patients: {cohort_no_hfno['patient_id'].nunique()}")
     return (
         cohort,
+        cohort_no_hfno,
         n_after_extub_loc,
         n_after_full_code,
         n_after_hfnc,
@@ -1211,7 +1234,7 @@ def _(
 
 
 @app.cell
-def _(Path, cohort, consort_flow, json):
+def _(Path, cohort, cohort_no_hfno, consort_flow, json):
     # Create output directories
     output_dir = Path(__file__).parent.parent / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1219,10 +1242,15 @@ def _(Path, cohort, consort_flow, json):
     output_to_share_dir = Path(__file__).parent.parent / "output_to_share"
     output_to_share_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save cohort parquet to output/
+    # Save HFNO cohort parquet to output/
     cohort_path = output_dir / "cohort_inclusion.parquet"
     cohort.to_parquet(cohort_path, index=False)
-    print(f"Cohort saved to: {cohort_path}")
+    print(f"HFNO cohort saved to: {cohort_path}")
+
+    # Save no-HFNO cohort parquet to output/
+    no_hfno_path = output_dir / "cohort_no_hfno.parquet"
+    cohort_no_hfno.to_parquet(no_hfno_path, index=False)
+    print(f"No-HFNO cohort saved to: {no_hfno_path}")
 
     # Save CONSORT flow JSON to output_to_share/
     consort_path = output_to_share_dir / "consort_inclusion.json"
@@ -1230,7 +1258,8 @@ def _(Path, cohort, consort_flow, json):
         json.dump(consort_flow, consort_file, indent=2)
     print(f"CONSORT flow saved to: {consort_path}")
 
-    print(f"\nCohort columns: {cohort.columns.tolist()}")
+    print(f"\nHFNO cohort columns: {cohort.columns.tolist()}")
+    print(f"No-HFNO cohort columns: {cohort_no_hfno.columns.tolist()}")
     return
 
 

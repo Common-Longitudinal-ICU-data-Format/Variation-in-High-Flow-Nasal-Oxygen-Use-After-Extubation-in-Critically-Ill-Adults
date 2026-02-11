@@ -11,8 +11,17 @@ def _():
     import polars as pl
     import json
     from pathlib import Path
-    from clifpy.tables import Patient
-    return Path, Patient, json, mo, pd, pl
+    from clifpy.tables import Patient, CrrtTherapy, MedicationAdminContinuous
+    return (
+        CrrtTherapy,
+        MedicationAdminContinuous,
+        Path,
+        Patient,
+        json,
+        mo,
+        pd,
+        pl,
+    )
 
 
 @app.cell
@@ -31,6 +40,18 @@ def _(mo):
       to NIPPV/CPAP/IMV, and alive at Day 7.
     - **`time_to_hfno_weaning_hours`** = hours from first HFNO after extubation to first sustained
       transition to low-support device. Null if not definitively weaned.
+
+    **Life support prior to extubation** (ICU admission → extubation):
+    - **`crrt_prior`** = any CRRT during ICU stay before extubation
+    - **`vasopressor_prior`** = any vasopressor during ICU stay before extubation
+    - **`nippv_cpap_prior`** = any NIPPV/CPAP during ICU stay before extubation
+    - **`hfno_prior`** = any HFNO during ICU stay before extubation
+    - **`any_life_support_prior`** = OR of the four above
+
+    **Life support at time of extubation** (24h before extubation):
+    - **`crrt_at_extubation`** = CRRT within 24h before extubation
+    - **`vasopressor_at_extubation`** = vasopressor within 24h before extubation
+    - **`life_support_at_extubation`** = OR of the two above
     """)
     return
 
@@ -53,17 +74,26 @@ def _(Path, json):
 
 @app.cell
 def _(Path, pd, pl):
-    # Load cohort
-    cohort_pd = pd.read_parquet(
+    # Load HFNO cohort
+    cohort_hfno_pd = pd.read_parquet(
         Path(__file__).parent.parent / "output" / "cohort_inclusion.parquet"
     )
+    for col in cohort_hfno_pd.select_dtypes(include=["datetimetz"]).columns:
+        cohort_hfno_pd[col] = cohort_hfno_pd[col].dt.tz_localize(None)
+    cohort_hfno = pl.from_pandas(cohort_hfno_pd).with_columns(pl.lit(True).alias("is_hfno_cohort"))
+    del cohort_hfno_pd
 
-    # Strip tz from datetime columns
-    for col in cohort_pd.select_dtypes(include=["datetimetz"]).columns:
-        cohort_pd[col] = cohort_pd[col].dt.tz_localize(None)
+    # Load no-HFNO cohort
+    cohort_no_hfno_pd = pd.read_parquet(
+        Path(__file__).parent.parent / "output" / "cohort_no_hfno.parquet"
+    )
+    for col in cohort_no_hfno_pd.select_dtypes(include=["datetimetz"]).columns:
+        cohort_no_hfno_pd[col] = cohort_no_hfno_pd[col].dt.tz_localize(None)
+    cohort_no_hfno = pl.from_pandas(cohort_no_hfno_pd).with_columns(pl.lit(False).alias("is_hfno_cohort"))
+    del cohort_no_hfno_pd
 
-    cohort = pl.from_pandas(cohort_pd)
-    del cohort_pd
+    # Combine both cohorts
+    cohort = pl.concat([cohort_hfno, cohort_no_hfno])
 
     # Add 7-day window end
     cohort = cohort.with_columns(
@@ -73,7 +103,9 @@ def _(Path, pd, pl):
     cohort_ids = cohort["hospitalization_id"].to_list()
     cohort_patient_ids = cohort["patient_id"].unique().to_list()
 
-    print(f"Cohort loaded: {len(cohort)} hospitalizations, {len(cohort_patient_ids)} patients")
+    print(f"HFNO cohort: {len(cohort_hfno)} hospitalizations")
+    print(f"No-HFNO cohort: {len(cohort_no_hfno)} hospitalizations")
+    print(f"Combined cohort: {len(cohort)} hospitalizations, {len(cohort_patient_ids)} patients")
     print(f"Columns: {cohort.columns}")
     return cohort, cohort_ids, cohort_patient_ids
 
@@ -134,6 +166,155 @@ def _(
 
     print(f"Death info: {death_by_hosp['death_dttm'].is_not_null().sum()} hospitalizations with death_dttm")
     return (death_by_hosp,)
+
+
+@app.cell
+def _(CrrtTherapy, DATA_DIR, FILETYPE, TIMEZONE, cohort, cohort_ids, pd, pl):
+    # Load CRRT table
+    crrt_table = CrrtTherapy.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": cohort_ids},
+    )
+    crrt_pd = crrt_table.df[["hospitalization_id", "recorded_dttm"]].copy()
+    crrt_pd["recorded_dttm"] = pd.to_datetime(crrt_pd["recorded_dttm"], errors="coerce")
+    if crrt_pd["recorded_dttm"].dt.tz is not None:
+        crrt_pd["recorded_dttm"] = crrt_pd["recorded_dttm"].dt.tz_localize(None)
+
+    crrt = pl.from_pandas(crrt_pd)
+    del crrt_pd
+
+    crrt_with_cohort = crrt.join(
+        cohort.select(["hospitalization_id", "icu_start", "extubation_time"]),
+        on="hospitalization_id",
+        how="inner",
+    )
+
+    # crrt_prior: any CRRT record in [icu_start, extubation_time)
+    crrt_prior = (
+        crrt_with_cohort
+        .filter(
+            (pl.col("recorded_dttm") >= pl.col("icu_start"))
+            & (pl.col("recorded_dttm") < pl.col("extubation_time"))
+        )
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("crrt_prior"))
+    )
+
+    # crrt_at_extubation: any CRRT record in [extubation_time - 24h, extubation_time]
+    crrt_at_extubation = (
+        crrt_with_cohort
+        .filter(
+            (pl.col("recorded_dttm") >= (pl.col("extubation_time") - pl.duration(hours=24)))
+            & (pl.col("recorded_dttm") <= pl.col("extubation_time"))
+        )
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("crrt_at_extubation"))
+    )
+
+    print(f"CRRT prior to extubation: {len(crrt_prior)} hospitalizations")
+    print(f"CRRT at extubation (24h window): {len(crrt_at_extubation)} hospitalizations")
+    return crrt_at_extubation, crrt_prior
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    MedicationAdminContinuous,
+    TIMEZONE,
+    cohort,
+    cohort_ids,
+    pd,
+    pl,
+):
+    # Load MedicationAdminContinuous filtered to vasoactives
+    med_table = MedicationAdminContinuous.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": cohort_ids, "med_group": "vasoactives"},
+    )
+    med_pd = med_table.df[["hospitalization_id", "admin_dttm"]].copy()
+    med_pd["admin_dttm"] = pd.to_datetime(med_pd["admin_dttm"], errors="coerce")
+    if med_pd["admin_dttm"].dt.tz is not None:
+        med_pd["admin_dttm"] = med_pd["admin_dttm"].dt.tz_localize(None)
+
+    vaso = pl.from_pandas(med_pd)
+    del med_pd
+
+    vaso_with_cohort = vaso.join(
+        cohort.select(["hospitalization_id", "icu_start", "extubation_time"]),
+        on="hospitalization_id",
+        how="inner",
+    )
+
+    # vasopressor_prior: any vasoactive record in [icu_start, extubation_time)
+    vasopressor_prior = (
+        vaso_with_cohort
+        .filter(
+            (pl.col("admin_dttm") >= pl.col("icu_start"))
+            & (pl.col("admin_dttm") < pl.col("extubation_time"))
+        )
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("vasopressor_prior"))
+    )
+
+    # vasopressor_at_extubation: any vasoactive record in [extubation_time - 24h, extubation_time]
+    vasopressor_at_extubation = (
+        vaso_with_cohort
+        .filter(
+            (pl.col("admin_dttm") >= (pl.col("extubation_time") - pl.duration(hours=24)))
+            & (pl.col("admin_dttm") <= pl.col("extubation_time"))
+        )
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("vasopressor_at_extubation"))
+    )
+
+    print(f"Vasopressor prior to extubation: {len(vasopressor_prior)} hospitalizations")
+    print(f"Vasopressor at extubation (24h window): {len(vasopressor_at_extubation)} hospitalizations")
+    return vasopressor_at_extubation, vasopressor_prior
+
+
+@app.cell
+def _(cohort, pl, resp):
+    # NIPPV/CPAP and HFNO prior flags from resp waterfall
+    # Window: [icu_start, extubation_time)
+    resp_prior = resp.join(
+        cohort.select(["hospitalization_id", "icu_start", "extubation_time"]),
+        on="hospitalization_id",
+        how="inner",
+    ).filter(
+        (pl.col("recorded_dttm") >= pl.col("icu_start"))
+        & (pl.col("recorded_dttm") < pl.col("extubation_time"))
+    )
+
+    # nippv_cpap_prior: any NIPPV/CPAP in [icu_start, extubation_time)
+    nippv_cpap_prior = (
+        resp_prior
+        .filter(pl.col("device_category").is_in(["nippv", "cpap"]))
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("nippv_cpap_prior"))
+    )
+
+    # hfno_prior: any HFNO in [icu_start, extubation_time)
+    hfno_prior = (
+        resp_prior
+        .filter(pl.col("device_category") == "high flow nc")
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("hfno_prior"))
+    )
+
+    print(f"NIPPV/CPAP prior to extubation: {len(nippv_cpap_prior)} hospitalizations")
+    print(f"HFNO prior to extubation: {len(hfno_prior)} hospitalizations")
+    return hfno_prior, nippv_cpap_prior
 
 
 @app.cell
@@ -351,12 +532,18 @@ def _(cohort, death_by_hosp, pl, resp):
 @app.cell
 def _(
     cohort,
+    crrt_at_extubation,
+    crrt_prior,
     death_flag,
+    hfno_prior,
     hfno_weaning,
     nippv_cpap_flag,
     nippv_cpap_icu_flag,
+    nippv_cpap_prior,
     pl,
     reintubation_flag,
+    vasopressor_at_extubation,
+    vasopressor_prior,
 ):
     # Build extubation success flags and merge to cohort
     result = (
@@ -366,16 +553,30 @@ def _(
         .join(nippv_cpap_flag, on="hospitalization_id", how="left")
         .join(nippv_cpap_icu_flag, on="hospitalization_id", how="left")
         .join(hfno_weaning, on="hospitalization_id", how="left")
+        .join(crrt_prior, on="hospitalization_id", how="left")
+        .join(crrt_at_extubation, on="hospitalization_id", how="left")
+        .join(vasopressor_prior, on="hospitalization_id", how="left")
+        .join(vasopressor_at_extubation, on="hospitalization_id", how="left")
+        .join(nippv_cpap_prior, on="hospitalization_id", how="left")
+        .join(hfno_prior, on="hospitalization_id", how="left")
         .with_columns([
             pl.col("reintubation_in_7d").fill_null(False),
             pl.col("death_in_7d").fill_null(False),
             pl.col("nippv_cpap_in_7d").fill_null(False),
             pl.col("nippv_cpap_in_7d_plus_in_ICU").fill_null(False),
             pl.col("definitive_hfno_weaning").fill_null(False),
+            pl.col("crrt_prior").fill_null(False),
+            pl.col("crrt_at_extubation").fill_null(False),
+            pl.col("vasopressor_prior").fill_null(False),
+            pl.col("vasopressor_at_extubation").fill_null(False),
+            pl.col("nippv_cpap_prior").fill_null(False),
+            pl.col("hfno_prior").fill_null(False),
         ])
         .with_columns([
             (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d")).alias("extubation_success_7d"),
             (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d") & ~pl.col("nippv_cpap_in_7d")).alias("extubation_success_strict_7d"),
+            (pl.col("crrt_prior") | pl.col("vasopressor_prior") | pl.col("nippv_cpap_prior") | pl.col("hfno_prior")).alias("any_life_support_prior"),
+            (pl.col("crrt_at_extubation") | pl.col("vasopressor_at_extubation")).alias("life_support_at_extubation"),
         ])
     )
 
@@ -388,6 +589,14 @@ def _(
     n_success_strict = result["extubation_success_strict_7d"].sum()
     n_hfno_weaned = result["definitive_hfno_weaning"].sum()
     n_hfno_weaned_with_time = result["time_to_hfno_weaning_hours"].is_not_null().sum()
+    n_crrt_prior = result["crrt_prior"].sum()
+    n_crrt_at_ext = result["crrt_at_extubation"].sum()
+    n_vaso_prior = result["vasopressor_prior"].sum()
+    n_vaso_at_ext = result["vasopressor_at_extubation"].sum()
+    n_nippv_prior = result["nippv_cpap_prior"].sum()
+    n_hfno_prior = result["hfno_prior"].sum()
+    n_any_ls_prior = result["any_life_support_prior"].sum()
+    n_ls_at_ext = result["life_support_at_extubation"].sum()
 
     print("=== Column Descriptions ===")
     print(f"  window_end_7d: End of 7-day observation window (extubation_time + 168h)")
@@ -407,19 +616,25 @@ def _(
     print(f"    -> {n_hfno_weaned}/{N} ({n_hfno_weaned / N * 100:.1f}%)")
     print(f"  time_to_hfno_weaning_hours: Hours from first HFNO to sustained low-support transition")
     print(f"    -> {n_hfno_weaned_with_time} patients with non-null values")
+    print()
+    print("=== Life Support Flags ===")
+    print(f"  crrt_prior: CRRT during ICU stay before extubation")
+    print(f"    -> {n_crrt_prior}/{N} ({n_crrt_prior / N * 100:.1f}%)")
+    print(f"  vasopressor_prior: Vasopressor during ICU stay before extubation")
+    print(f"    -> {n_vaso_prior}/{N} ({n_vaso_prior / N * 100:.1f}%)")
+    print(f"  nippv_cpap_prior: NIPPV/CPAP during ICU stay before extubation")
+    print(f"    -> {n_nippv_prior}/{N} ({n_nippv_prior / N * 100:.1f}%)")
+    print(f"  hfno_prior: HFNO during ICU stay before extubation")
+    print(f"    -> {n_hfno_prior}/{N} ({n_hfno_prior / N * 100:.1f}%)")
+    print(f"  any_life_support_prior: Any of CRRT/vasopressor/NIPPV-CPAP/HFNO prior")
+    print(f"    -> {n_any_ls_prior}/{N} ({n_any_ls_prior / N * 100:.1f}%)")
+    print(f"  crrt_at_extubation: CRRT within 24h before extubation")
+    print(f"    -> {n_crrt_at_ext}/{N} ({n_crrt_at_ext / N * 100:.1f}%)")
+    print(f"  vasopressor_at_extubation: Vasopressor within 24h before extubation")
+    print(f"    -> {n_vaso_at_ext}/{N} ({n_vaso_at_ext / N * 100:.1f}%)")
+    print(f"  life_support_at_extubation: CRRT or vasopressor within 24h before extubation")
+    print(f"    -> {n_ls_at_ext}/{N} ({n_ls_at_ext / N * 100:.1f}%)")
     return (result,)
-
-
-@app.cell
-def _(result):
-    result['time_to_hfno_weaning_hours'].median()
-    return
-
-
-@app.cell
-def _(result):
-    result['time_to_hfno_weaning_hours'].mean()
-    return
 
 
 @app.cell
