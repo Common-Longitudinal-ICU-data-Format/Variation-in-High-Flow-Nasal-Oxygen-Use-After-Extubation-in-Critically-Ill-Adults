@@ -12,10 +12,12 @@ def _():
     import json
     import matplotlib.pyplot as plt
     from pathlib import Path
-    from clifpy.tables import Vitals, HospitalDiagnosis, Patient
+    from clifpy.tables import Vitals, HospitalDiagnosis, Patient, MedicationAdminContinuous, Hospitalization
     from clifpy import calculate_cci
     return (
         HospitalDiagnosis,
+        Hospitalization,
+        MedicationAdminContinuous,
         Path,
         Patient,
         Vitals,
@@ -870,6 +872,347 @@ def _(panel, pl, plt):
     plt.xlabel("Time (hours)")
     plt.ylabel("FiO2 (%)")
     plt.legend()
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md("""
+    # ROX Prediction Flat File
+
+    A one-row-per-hospitalization dataset for ROX-based extubation outcome prediction.
+    Combines demographics, comorbidities, severity, vasopressor flags, ROX index at
+    3 early time points, and 4 binary outcomes.
+    """)
+    return
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    MedicationAdminContinuous,
+    TIMEZONE,
+    cohort,
+    cohort_ids,
+    pd,
+    pl,
+):
+    # Load vasopressor (vasoactive) medication data
+    vaso_table = MedicationAdminContinuous.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": cohort_ids, "med_group": "vasoactives"},
+    )
+    vaso_pd = vaso_table.df[["hospitalization_id", "admin_dttm"]].copy()
+    vaso_pd["admin_dttm"] = pd.to_datetime(vaso_pd["admin_dttm"], errors="coerce")
+    if vaso_pd["admin_dttm"].dt.tz is not None:
+        vaso_pd["admin_dttm"] = vaso_pd["admin_dttm"].dt.tz_localize(None)
+
+    vaso = pl.from_pandas(vaso_pd)
+    del vaso_pd
+
+    # Join with extubation time
+    vaso_ext = vaso.join(
+        cohort.select(["hospitalization_id", "extubation_time"]),
+        on="hospitalization_id",
+        how="inner",
+    )
+
+    # Compute per-window vasopressor flags (0-4h, 4-8h, 8-12h post-extubation)
+    _window_defs = [
+        ("vasopressor_0_4h", 0, 4),
+        ("vasopressor_4_8h", 4, 8),
+        ("vasopressor_8_12h", 8, 12),
+    ]
+
+    _vaso_flags = cohort.select("hospitalization_id")
+    for _col_name, _start_h, _end_h in _window_defs:
+        _flag = (
+            vaso_ext
+            .filter(
+                (pl.col("admin_dttm") >= (pl.col("extubation_time") + pl.duration(hours=_start_h)))
+                & (pl.col("admin_dttm") < (pl.col("extubation_time") + pl.duration(hours=_end_h)))
+            )
+            .select("hospitalization_id")
+            .unique()
+            .with_columns(pl.lit(True).alias(_col_name))
+        )
+        _vaso_flags = _vaso_flags.join(_flag, on="hospitalization_id", how="left")
+
+    vaso_windows = _vaso_flags.with_columns([
+        pl.col("vasopressor_0_4h").fill_null(False),
+        pl.col("vasopressor_4_8h").fill_null(False),
+        pl.col("vasopressor_8_12h").fill_null(False),
+    ])
+
+    print(f"Vasopressor flags computed:")
+    for _col_name, _, _ in _window_defs:
+        _n_true = vaso_windows[_col_name].sum()
+        print(f"  {_col_name}: {_n_true} ({_n_true / len(vaso_windows) * 100:.1f}%)")
+    return (vaso_windows,)
+
+
+@app.cell
+def _(
+    DATA_DIR,
+    FILETYPE,
+    HospitalDiagnosis,
+    Hospitalization,
+    TIMEZONE,
+    cohort,
+    cohort_patient_ids,
+    pd,
+    pl,
+):
+    # Chronic respiratory failure with hypoxia (J96.11) from PRIOR hospitalizations
+
+    # Load ALL hospitalizations for cohort patients (not just current)
+    all_hosp_table = Hospitalization.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"patient_id": cohort_patient_ids},
+    )
+    all_hosp_pd = all_hosp_table.df[["hospitalization_id", "patient_id", "admission_dttm"]].copy()
+    all_hosp_pd["admission_dttm"] = pd.to_datetime(all_hosp_pd["admission_dttm"], errors="coerce")
+    if all_hosp_pd["admission_dttm"].dt.tz is not None:
+        all_hosp_pd["admission_dttm"] = all_hosp_pd["admission_dttm"].dt.tz_localize(None)
+    all_hosp = pl.from_pandas(all_hosp_pd)
+    del all_hosp_pd
+
+    # Load diagnoses for ALL hospitalizations of these patients
+    all_hosp_ids = all_hosp["hospitalization_id"].to_list()
+    all_diag_table = HospitalDiagnosis.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": all_hosp_ids},
+    )
+    all_diag_pd = all_diag_table.df[["hospitalization_id", "diagnosis_code"]].copy()
+    all_diag = pl.from_pandas(all_diag_pd)
+    del all_diag_pd
+
+    # Clean diagnosis codes: lowercase, remove dots
+    all_diag = all_diag.with_columns(
+        pl.col("diagnosis_code").str.to_lowercase().str.replace_all(r"\.", "").alias("dx_clean")
+    )
+
+    # Filter to J96.11 (chronic respiratory failure with hypoxia)
+    j9611_diag = all_diag.filter(pl.col("dx_clean").str.starts_with("j9611"))
+
+    # Join with hospitalization to get admission_dttm and patient_id
+    j9611_hosp = j9611_diag.join(
+        all_hosp.select(["hospitalization_id", "patient_id", "admission_dttm"]),
+        on="hospitalization_id",
+        how="inner",
+    ).select(["patient_id", "admission_dttm"]).unique()
+
+    # For each cohort hospitalization, check if patient has ANY prior hospitalization with J96.11
+    cohort_admit = cohort.select(["hospitalization_id", "patient_id"]).join(
+        all_hosp.select(["hospitalization_id", "admission_dttm"]),
+        on="hospitalization_id",
+        how="left",
+    ).rename({"admission_dttm": "cohort_admit_dttm"})
+
+    j9611_prior = (
+        cohort_admit
+        .join(j9611_hosp, on="patient_id", how="left")
+        .filter(
+            pl.col("admission_dttm").is_not_null()
+            & (pl.col("admission_dttm") < pl.col("cohort_admit_dttm"))
+        )
+        .select("hospitalization_id")
+        .unique()
+        .with_columns(pl.lit(True).alias("chronic_resp_failure_hypoxia"))
+    )
+
+    # Join back to full cohort
+    j9611_flag = (
+        cohort.select("hospitalization_id")
+        .join(j9611_prior, on="hospitalization_id", how="left")
+        .with_columns(pl.col("chronic_resp_failure_hypoxia").fill_null(False))
+    )
+
+    print(f"J96.11 prior hospitalization flag:")
+    _n_true = j9611_flag["chronic_resp_failure_hypoxia"].sum()
+    print(f"  True: {_n_true} ({_n_true / len(j9611_flag) * 100:.1f}%)")
+    return (j9611_flag,)
+
+
+@app.cell
+def _(pl, rox):
+    # Pivot ROX index for the first 3 windows (0-4h, 4-8h, 8-12h)
+    rox_early = rox.filter(pl.col("window_idx").is_in([0, 1, 2]))
+
+    rox_wide = (
+        rox_early
+        .with_columns(
+            pl.when(pl.col("window_idx") == 0).then(pl.lit("rox_0_4h"))
+            .when(pl.col("window_idx") == 1).then(pl.lit("rox_4_8h"))
+            .when(pl.col("window_idx") == 2).then(pl.lit("rox_8_12h"))
+            .alias("rox_col")
+        )
+        .pivot(on="rox_col", index="hospitalization_id", values="rox_index")
+    )
+
+    # Ensure all 3 columns exist (some may be missing if no data)
+    for _col_name in ["rox_0_4h", "rox_4_8h", "rox_8_12h"]:
+        if _col_name not in rox_wide.columns:
+            rox_wide = rox_wide.with_columns(pl.lit(None, dtype=pl.Float64).alias(_col_name))
+
+    rox_wide = rox_wide.select(["hospitalization_id", "rox_0_4h", "rox_4_8h", "rox_8_12h"])
+
+    print(f"ROX wide: {len(rox_wide)} hospitalizations with at least one early ROX value")
+    for _c in ["rox_0_4h", "rox_4_8h", "rox_8_12h"]:
+        _non_null = rox_wide[_c].is_not_null().sum()
+        print(f"  {_c}: {_non_null} non-null")
+    return (rox_wide,)
+
+
+@app.cell
+def _(cohort, events, pl):
+    # Compute 4 binary extubation success outcomes
+
+    outcome_base = (
+        cohort.select(["hospitalization_id", "extubation_time"])
+        .join(events.select(["hospitalization_id", "reintubation_time", "nippv_cpap_time", "death_time"]),
+              on="hospitalization_id", how="left")
+    )
+
+    # Define time windows
+    outcome_base = outcome_base.with_columns([
+        (pl.col("extubation_time") + pl.duration(hours=72)).alias("cutoff_3d"),
+        (pl.col("extubation_time") + pl.duration(hours=168)).alias("cutoff_7d"),
+    ])
+
+    # Event flags within each window
+    outcome_base = outcome_base.with_columns([
+        # 3-day flags
+        (
+            pl.col("reintubation_time").is_not_null()
+            & (pl.col("reintubation_time") <= pl.col("cutoff_3d"))
+        ).alias("reintubation_in_3d"),
+        (
+            pl.col("death_time").is_not_null()
+            & (pl.col("death_time") > pl.col("extubation_time"))
+            & (pl.col("death_time") <= pl.col("cutoff_3d"))
+        ).alias("death_in_3d"),
+        (
+            pl.col("nippv_cpap_time").is_not_null()
+            & (pl.col("nippv_cpap_time") <= pl.col("cutoff_3d"))
+        ).alias("nippv_cpap_in_3d"),
+        # 7-day flags
+        (
+            pl.col("reintubation_time").is_not_null()
+            & (pl.col("reintubation_time") <= pl.col("cutoff_7d"))
+        ).alias("reintubation_in_7d"),
+        (
+            pl.col("death_time").is_not_null()
+            & (pl.col("death_time") > pl.col("extubation_time"))
+            & (pl.col("death_time") <= pl.col("cutoff_7d"))
+        ).alias("death_in_7d"),
+        (
+            pl.col("nippv_cpap_time").is_not_null()
+            & (pl.col("nippv_cpap_time") <= pl.col("cutoff_7d"))
+        ).alias("nippv_cpap_in_7d"),
+    ])
+
+    # Compute success outcomes
+    flat_outcomes = outcome_base.select([
+        "hospitalization_id",
+        (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d")).alias("extubation_success_7d"),
+        (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d") & ~pl.col("nippv_cpap_in_7d")).alias("extubation_success_strict_7d"),
+        (~pl.col("death_in_3d") & ~pl.col("reintubation_in_3d")).alias("extubation_success_3d"),
+        (~pl.col("death_in_3d") & ~pl.col("reintubation_in_3d") & ~pl.col("nippv_cpap_in_3d")).alias("extubation_success_strict_3d"),
+    ])
+
+    print(f"Extubation outcomes computed for {len(flat_outcomes)} hospitalizations:")
+    for _c in ["extubation_success_7d", "extubation_success_strict_7d", "extubation_success_3d", "extubation_success_strict_3d"]:
+        _n_success = flat_outcomes[_c].sum()
+        print(f"  {_c}: {_n_success} ({_n_success / len(flat_outcomes) * 100:.1f}%) success")
+    return (flat_outcomes,)
+
+
+@app.cell
+def _(
+    Path,
+    cci_df,
+    cohort,
+    flat_outcomes,
+    j9611_flag,
+    pl,
+    rox_wide,
+    vaso_windows,
+):
+    # Assemble the ROX prediction flat file
+
+    _rox_flat = (
+        cohort.select([
+            "hospitalization_id",
+            pl.col("age_at_admission").alias("age"),
+            pl.col("sex_category").alias("sex"),
+            "sofa_extubation",
+        ])
+        .join(cci_df.rename({"cci_score": "cci"}), on="hospitalization_id", how="left")
+        .join(j9611_flag, on="hospitalization_id", how="left")
+        .join(vaso_windows, on="hospitalization_id", how="left")
+        .join(rox_wide, on="hospitalization_id", how="left")
+        .join(flat_outcomes, on="hospitalization_id", how="left")
+    )
+
+    # Fill null booleans with False
+    _bool_cols = [
+        "chronic_resp_failure_hypoxia",
+        "vasopressor_0_4h", "vasopressor_4_8h", "vasopressor_8_12h",
+    ]
+    _rox_flat = _rox_flat.with_columns([
+        pl.col(_c).fill_null(False) for _c in _bool_cols
+    ])
+
+    # Select final column order
+    _rox_flat = _rox_flat.select([
+        "hospitalization_id",
+        "age",
+        "sex",
+        "cci",
+        "chronic_resp_failure_hypoxia",
+        "sofa_extubation",
+        "vasopressor_0_4h",
+        "vasopressor_4_8h",
+        "vasopressor_8_12h",
+        "rox_0_4h",
+        "rox_4_8h",
+        "rox_8_12h",
+        "extubation_success_7d",
+        "extubation_success_strict_7d",
+        "extubation_success_3d",
+        "extubation_success_strict_3d",
+    ])
+
+    # Save
+    _rox_output_path = Path(__file__).parent.parent / "output" / "rox_prediction.parquet"
+    _rox_flat.write_parquet(_rox_output_path)
+
+    print(f"\n=== ROX Prediction Flat File ===")
+    print(f"Saved to: {_rox_output_path}")
+    print(f"Shape: {_rox_flat.shape}")
+    print(f"\nColumn summary:")
+    for _c in _rox_flat.columns:
+        _null_ct = _rox_flat[_c].is_null().sum()
+        _dtype = _rox_flat[_c].dtype
+        if _dtype == pl.Boolean:
+            _n_true = _rox_flat[_c].sum()
+            print(f"  {_c} ({_dtype}): {_n_true} True ({_n_true / len(_rox_flat) * 100:.1f}%), {_null_ct} nulls")
+        elif _dtype in (pl.Float64, pl.Float32, pl.Int64, pl.Int32):
+            _non_null = _rox_flat.filter(pl.col(_c).is_not_null())
+            if len(_non_null) > 0:
+                print(f"  {_c} ({_dtype}): min={_non_null[_c].min()}, max={_non_null[_c].max()}, median={_non_null[_c].median()}, {_null_ct} nulls")
+            else:
+                print(f"  {_c} ({_dtype}): all null")
+        else:
+            print(f"  {_c} ({_dtype}): {_null_ct} nulls")
     return
 
 

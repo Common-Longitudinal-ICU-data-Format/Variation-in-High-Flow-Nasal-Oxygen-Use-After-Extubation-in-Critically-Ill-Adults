@@ -11,12 +11,13 @@ def _():
     import polars as pl
     import json
     from pathlib import Path
-    from clifpy.tables import Patient, CrrtTherapy, MedicationAdminContinuous
+    from clifpy.tables import Patient, CrrtTherapy, MedicationAdminContinuous, Vitals
     return (
         CrrtTherapy,
         MedicationAdminContinuous,
         Path,
         Patient,
+        Vitals,
         json,
         mo,
         pd,
@@ -52,6 +53,7 @@ def _(mo):
     - **`crrt_at_extubation`** = CRRT within 24h before extubation
     - **`vasopressor_at_extubation`** = vasopressor within 24h before extubation
     - **`life_support_at_extubation`** = OR of the two above
+    - **`worst_sf_ratio_at_extubation`** = worst (lowest) SpO2/FiO2 ratio in 24h before extubation
     """)
     return
 
@@ -83,17 +85,17 @@ def _(Path, pd, pl):
     cohort_hfno = pl.from_pandas(cohort_hfno_pd).with_columns(pl.lit(True).alias("is_hfno_cohort"))
     del cohort_hfno_pd
 
-    # Load no-HFNO cohort
-    cohort_no_hfno_pd = pd.read_parquet(
-        Path(__file__).parent.parent / "output" / "cohort_no_hfno.parquet"
+    # Load low-flow cohort
+    cohort_low_flow_pd = pd.read_parquet(
+        Path(__file__).parent.parent / "output" / "cohort_low_flow.parquet"
     )
-    for col in cohort_no_hfno_pd.select_dtypes(include=["datetimetz"]).columns:
-        cohort_no_hfno_pd[col] = cohort_no_hfno_pd[col].dt.tz_localize(None)
-    cohort_no_hfno = pl.from_pandas(cohort_no_hfno_pd).with_columns(pl.lit(False).alias("is_hfno_cohort"))
-    del cohort_no_hfno_pd
+    for col in cohort_low_flow_pd.select_dtypes(include=["datetimetz"]).columns:
+        cohort_low_flow_pd[col] = cohort_low_flow_pd[col].dt.tz_localize(None)
+    cohort_low_flow = pl.from_pandas(cohort_low_flow_pd).with_columns(pl.lit(False).alias("is_hfno_cohort"))
+    del cohort_low_flow_pd
 
     # Combine both cohorts
-    cohort = pl.concat([cohort_hfno, cohort_no_hfno])
+    cohort = pl.concat([cohort_hfno, cohort_low_flow])
 
     # Add 7-day window end
     cohort = cohort.with_columns(
@@ -104,7 +106,7 @@ def _(Path, pd, pl):
     cohort_patient_ids = cohort["patient_id"].unique().to_list()
 
     print(f"HFNO cohort: {len(cohort_hfno)} hospitalizations")
-    print(f"No-HFNO cohort: {len(cohort_no_hfno)} hospitalizations")
+    print(f"Low-flow cohort: {len(cohort_low_flow)} hospitalizations")
     print(f"Combined cohort: {len(cohort)} hospitalizations, {len(cohort_patient_ids)} patients")
     print(f"Columns: {cohort.columns}")
     return cohort, cohort_ids, cohort_patient_ids
@@ -129,6 +131,80 @@ def _(Path, cohort_ids, pd, pl):
 
     print(f"Resp waterfall loaded: {len(resp)} rows for {resp['hospitalization_id'].n_unique()} hospitalizations")
     return (resp,)
+
+
+@app.cell
+def _(DATA_DIR, FILETYPE, TIMEZONE, Vitals, cohort_ids, pd, pl):
+    # Load SpO2 vitals from CLIF Vitals table
+    vitals_table = Vitals.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={
+            "hospitalization_id": cohort_ids,
+            "vital_category": ["spo2"],
+        },
+    )
+    vitals_pd = vitals_table.df.copy()
+
+    # Strip tz
+    if vitals_pd["recorded_dttm"].dt.tz is not None:
+        vitals_pd["recorded_dttm"] = vitals_pd["recorded_dttm"].dt.tz_localize(None)
+
+    spo2_vitals = pl.from_pandas(vitals_pd)
+    del vitals_pd
+
+    print(f"SpO2 vitals loaded: {len(spo2_vitals)} rows for {spo2_vitals['hospitalization_id'].n_unique()} hospitalizations")
+    return (spo2_vitals,)
+
+
+@app.cell
+def _(cohort, pl, resp, spo2_vitals):
+    # Compute worst (lowest) S/F ratio in the 24h before extubation
+    # S/F ratio = min(SpO2) / max(FiO2) in the window
+
+    extub_window = cohort.select(["hospitalization_id", "extubation_time"])
+
+    # Min SpO2 in [extubation_time - 24h, extubation_time]
+    min_spo2 = (
+        spo2_vitals
+        .join(extub_window, on="hospitalization_id", how="inner")
+        .filter(
+            (pl.col("recorded_dttm") >= (pl.col("extubation_time") - pl.duration(hours=24)))
+            & (pl.col("recorded_dttm") <= pl.col("extubation_time"))
+        )
+        .group_by("hospitalization_id")
+        .agg(pl.col("vital_value").min().alias("min_spo2"))
+    )
+
+    # Max FiO2 in [extubation_time - 24h, extubation_time]
+    max_fio2 = (
+        resp
+        .filter(pl.col("fio2_set").is_not_null())
+        .join(extub_window, on="hospitalization_id", how="inner")
+        .filter(
+            (pl.col("recorded_dttm") >= (pl.col("extubation_time") - pl.duration(hours=24)))
+            & (pl.col("recorded_dttm") <= pl.col("extubation_time"))
+        )
+        .group_by("hospitalization_id")
+        .agg(pl.col("fio2_set").max().alias("max_fio2"))
+    )
+
+    # Join and compute ratio
+    sf_at_extubation = (
+        min_spo2
+        .join(max_fio2, on="hospitalization_id", how="inner")
+        .with_columns(
+            (pl.col("min_spo2") / pl.col("max_fio2")).alias("worst_sf_ratio_at_extubation")
+        )
+        .select(["hospitalization_id", "worst_sf_ratio_at_extubation"])
+    )
+
+    n_sf = len(sf_at_extubation)
+    median_sf = sf_at_extubation["worst_sf_ratio_at_extubation"].median()
+    print(f"Worst S/F ratio at extubation: {n_sf} hospitalizations with values")
+    print(f"  Median: {median_sf:.1f}")
+    return (sf_at_extubation,)
 
 
 @app.cell
@@ -542,6 +618,7 @@ def _(
     nippv_cpap_prior,
     pl,
     reintubation_flag,
+    sf_at_extubation,
     vasopressor_at_extubation,
     vasopressor_prior,
 ):
@@ -559,6 +636,7 @@ def _(
         .join(vasopressor_at_extubation, on="hospitalization_id", how="left")
         .join(nippv_cpap_prior, on="hospitalization_id", how="left")
         .join(hfno_prior, on="hospitalization_id", how="left")
+        .join(sf_at_extubation, on="hospitalization_id", how="left")
         .with_columns([
             pl.col("reintubation_in_7d").fill_null(False),
             pl.col("death_in_7d").fill_null(False),
@@ -597,6 +675,11 @@ def _(
     n_hfno_prior = result["hfno_prior"].sum()
     n_any_ls_prior = result["any_life_support_prior"].sum()
     n_ls_at_ext = result["life_support_at_extubation"].sum()
+    sf_col = result["worst_sf_ratio_at_extubation"].drop_nulls()
+    n_sf_nonnull = len(sf_col)
+    sf_median = sf_col.median() if n_sf_nonnull > 0 else None
+    sf_q25 = sf_col.quantile(0.25) if n_sf_nonnull > 0 else None
+    sf_q75 = sf_col.quantile(0.75) if n_sf_nonnull > 0 else None
 
     print("=== Column Descriptions ===")
     print(f"  window_end_7d: End of 7-day observation window (extubation_time + 168h)")
@@ -634,6 +717,10 @@ def _(
     print(f"    -> {n_vaso_at_ext}/{N} ({n_vaso_at_ext / N * 100:.1f}%)")
     print(f"  life_support_at_extubation: CRRT or vasopressor within 24h before extubation")
     print(f"    -> {n_ls_at_ext}/{N} ({n_ls_at_ext / N * 100:.1f}%)")
+    print(f"  worst_sf_ratio_at_extubation: Worst (lowest) SpO2/FiO2 ratio in 24h before extubation")
+    print(f"    -> {n_sf_nonnull}/{N} non-null ({n_sf_nonnull / N * 100:.1f}%)")
+    if sf_median is not None:
+        print(f"    -> Median: {sf_median:.1f}, IQR: [{sf_q25:.1f}, {sf_q75:.1f}]")
     return (result,)
 
 

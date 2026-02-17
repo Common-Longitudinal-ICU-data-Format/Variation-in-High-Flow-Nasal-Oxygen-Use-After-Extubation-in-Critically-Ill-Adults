@@ -22,7 +22,7 @@ def _(mo):
     mo.md("""
     # 04 Table 1: Baseline Characteristics
 
-    Generates Table 1 comparing HFNO vs No-HFNO after extubation groups.
+    Generates Table 1 comparing HFNO vs Low-Flow after extubation groups.
     Outputs CSV and JSON to `output_to_share/`.
     """)
     return
@@ -64,7 +64,7 @@ def _(Path, pd, pl):
 
     print(f"Total cohort: {len(cohort)}")
     print(f"HFNO group: {len(hfno_group)}")
-    print(f"No-HFNO group: {len(no_hfno_group)}")
+    print(f"Low-flow group: {len(no_hfno_group)}")
     return (cohort,)
 
 
@@ -270,13 +270,13 @@ def _(compute_group_stats, df, pl):
         table_rows.append({
             "variable": _var,
             "hfno_after_extubation": stats_hfno[_var],
-            "no_hfno_after_extubation": stats_no_hfno[_var],
+            "low_flow_after_extubation": stats_no_hfno[_var],
             "overall": stats_overall[_var],
         })
 
     print(f"Table 1 generated with {len(table_rows)} rows")
     for _row in table_rows:
-        print(f"  {_row['variable']}: HFNO={_row['hfno_after_extubation']}, No HFNO={_row['no_hfno_after_extubation']}, Overall={_row['overall']}")
+        print(f"  {_row['variable']}: HFNO={_row['hfno_after_extubation']}, Low Flow={_row['low_flow_after_extubation']}, Overall={_row['overall']}")
     return (table_rows,)
 
 
@@ -291,7 +291,7 @@ def _(Path, SITE, json, pd, table_rows):
         _row["site"] = SITE
 
     # CSV
-    table_df = pd.DataFrame(table_rows)[["variable", "site", "hfno_after_extubation", "no_hfno_after_extubation", "overall"]]
+    table_df = pd.DataFrame(table_rows)[["variable", "site", "hfno_after_extubation", "low_flow_after_extubation", "overall"]]
     csv_path = output_dir / "table1.csv"
     table_df.to_csv(csv_path, index=False)
     print(f"Table 1 CSV saved to: {csv_path}")
