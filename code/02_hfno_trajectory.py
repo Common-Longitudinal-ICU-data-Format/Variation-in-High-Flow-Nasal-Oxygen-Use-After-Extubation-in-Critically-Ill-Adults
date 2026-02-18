@@ -699,7 +699,62 @@ def _(pl, resp_agg, vitals_agg):
 
 
 @app.cell
-def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vitals_agg):
+def _(outcomes, pl, vaso_ext):
+    # Aggregate vasopressor administrations per window
+    vaso_windowed = (
+        vaso_ext
+        .filter(pl.col("admin_dttm") > pl.col("extubation_time"))
+        .join(
+            outcomes.select(["hospitalization_id", "window_idx", "window_start", "window_end"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(
+            (pl.col("admin_dttm") >= pl.col("window_start"))
+            & (pl.col("admin_dttm") < pl.col("window_end"))
+        )
+    )
+
+    # Raw per-window flag
+    vaso_raw = (
+        vaso_windowed
+        .select(["hospitalization_id", "window_idx"])
+        .unique()
+        .with_columns(pl.lit(True).alias("is_vaso"))
+    )
+
+    # Build full grid and fill single-window gaps (1,0,1 → 1,1,1)
+    vaso_grid = (
+        outcomes.select(["hospitalization_id", "window_idx"])
+        .unique()
+        .join(vaso_raw, on=["hospitalization_id", "window_idx"], how="left")
+        .with_columns(pl.col("is_vaso").fill_null(False))
+        .sort(["hospitalization_id", "window_idx"])
+    )
+
+    vaso_agg = (
+        vaso_grid
+        .with_columns(
+            pl.when(
+                ~pl.col("is_vaso")
+                & pl.col("is_vaso").shift(1).over("hospitalization_id")
+                & pl.col("is_vaso").shift(-1).over("hospitalization_id")
+            )
+            .then(True)
+            .otherwise(pl.col("is_vaso"))
+            .alias("is_vaso")
+        )
+        .filter(pl.col("is_vaso"))
+        .select(["hospitalization_id", "window_idx", "is_vaso"])
+    )
+
+    _n_filled = len(vaso_agg) - len(vaso_raw)
+    print(f"Vaso aggregates: {len(vaso_raw)} raw → {len(vaso_agg)} after gap-fill ({_n_filled} single gaps filled)")
+    return (vaso_agg,)
+
+
+@app.cell
+def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vaso_agg, vitals_agg):
     # Assemble final panel
 
     # Baseline demographics (repeated per window)
@@ -711,7 +766,7 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vitals_agg):
             pl.col("sex_category").alias("sex"),
             pl.col("race_category").alias("race"),
             "bmi",
-            "sofa_icu_admission",
+            "sofa_extubation",
         ])
         .join(cci_df, on="hospitalization_id", how="left")
         .rename({"cci_score": "cci"})
@@ -740,6 +795,10 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vitals_agg):
     # Join ROX index
     panel = panel.join(rox, on=["hospitalization_id", "window_idx"], how="left")
 
+    # Join vasopressor flag
+    panel = panel.join(vaso_agg, on=["hospitalization_id", "window_idx"], how="left")
+    panel = panel.with_columns(pl.col("is_vaso").fill_null(False))
+
     # Select final column order
     panel = panel.select([
         "window_idx",
@@ -753,7 +812,7 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vitals_agg):
         "race",
         "cci",
         "bmi",
-        "sofa_icu_admission",
+        "sofa_extubation",
         "sf_ratio",
         "sf_spo2",
         "sf_fio2",
@@ -764,6 +823,7 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vitals_agg):
         "rox_index",
         "rox_highest_rr",
         "rox_lowest_spo2",
+        "is_vaso",
         "outcome_death_reintubate",
         "outcome_death_reintubate_nippv_cpap",
     ])
@@ -951,7 +1011,7 @@ def _(
     for _col_name, _, _ in _window_defs:
         _n_true = vaso_windows[_col_name].sum()
         print(f"  {_col_name}: {_n_true} ({_n_true / len(vaso_windows) * 100:.1f}%)")
-    return (vaso_windows,)
+    return vaso_ext, vaso_windows
 
 
 @app.cell
