@@ -293,6 +293,187 @@ def _(cohort, death_by_hosp, pl, resp):
         ])
     )
 
+    # HFNO-free 48h: first time patient is off HFNO for 48 consecutive hours
+    # while alive and still in ICU, within the 7-day window
+    _post_ext_resp = (
+        resp
+        .join(
+            cohort.select(["hospitalization_id", "extubation_time"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(
+            (pl.col("recorded_dttm") > pl.col("extubation_time"))
+            & (pl.col("recorded_dttm") <= pl.col("extubation_time") + pl.duration(hours=168))
+        )
+        .with_columns(
+            (pl.col("device_category") == "high flow nc").alias("is_hfno"),
+        )
+        .sort(["hospitalization_id", "recorded_dttm"])
+    )
+
+    # Identify patients who NEVER had HFNO post-extubation within 7d
+    _hosp_with_hfno = (
+        _post_ext_resp
+        .filter(pl.col("is_hfno"))
+        .select("hospitalization_id")
+        .unique()
+    )
+    _hosp_never_hfno = (
+        cohort.select("hospitalization_id")
+        .join(_hosp_with_hfno, on="hospitalization_id", how="anti")
+        .join(
+            cohort.select(["hospitalization_id", "extubation_time", "icu_end"]),
+            on="hospitalization_id",
+            how="left",
+        )
+        .join(death_by_hosp, on="hospitalization_id", how="left")
+        .with_columns(
+            (pl.col("extubation_time") + pl.duration(hours=48)).alias("candidate_time"),
+        )
+        .filter(
+            # Still in ICU at candidate_time
+            (pl.col("candidate_time") <= pl.col("icu_end"))
+            # Alive at candidate_time
+            & (
+                pl.col("death_dttm").is_null()
+                | (pl.col("death_dttm") > pl.col("candidate_time"))
+            )
+            # Within 7-day window (always true: extubation + 48h <= extubation + 168h)
+        )
+        .select([
+            "hospitalization_id",
+            pl.col("candidate_time").alias("hfno_free_48h_time"),
+        ])
+    )
+
+    # For patients WITH HFNO: find transitions off HFNO, check 48h gap
+    # Get all HFNO records to check gaps against
+    _hfno_records = (
+        _post_ext_resp
+        .filter(pl.col("is_hfno"))
+        .select(["hospitalization_id", "recorded_dttm"])
+    )
+
+    # Detect off-transitions: record is HFNO, next record (same patient) is NOT HFNO
+    # The off-start is the time of the first non-HFNO record after an HFNO record
+    _with_next = (
+        _post_ext_resp
+        .with_columns(
+            pl.col("is_hfno").shift(-1).over("hospitalization_id").alias("next_is_hfno"),
+            pl.col("recorded_dttm").shift(-1).over("hospitalization_id").alias("next_time"),
+        )
+    )
+
+    # Off-transition points: current is HFNO, next is not (or is last record)
+    _off_starts = (
+        _with_next
+        .filter(
+            pl.col("is_hfno")
+            & (pl.col("next_is_hfno") == False)
+        )
+        .select([
+            "hospitalization_id",
+            pl.col("next_time").alias("off_start"),
+            "extubation_time",
+        ])
+    )
+
+    # Also include extubation_time as an off-start for patients whose first
+    # post-extubation record is NOT HFNO (they start off-HFNO)
+    _first_rec = (
+        _post_ext_resp
+        .group_by("hospitalization_id")
+        .first()
+        .filter(~pl.col("is_hfno"))
+        .select([
+            "hospitalization_id",
+            pl.col("extubation_time").alias("off_start"),
+            "extubation_time",
+        ])
+    )
+
+    _all_off_starts = pl.concat([_off_starts, _first_rec])
+
+    # Also handle: last record is HFNO — the "off" starts at the time AFTER the last HFNO record
+    # (captured by _off_starts when next_is_hfno==False; if last record is HFNO and has no next,
+    #  next_is_hfno is null, so we handle that separately)
+    _last_hfno_off = (
+        _with_next
+        .filter(
+            pl.col("is_hfno")
+            & pl.col("next_is_hfno").is_null()  # last record for this patient
+        )
+        .select([
+            "hospitalization_id",
+            # Off starts at this record's time (it's the last HFNO, nothing after)
+            pl.col("recorded_dttm").alias("off_start"),
+            "extubation_time",
+        ])
+    )
+    _all_off_starts = pl.concat([_all_off_starts, _last_hfno_off])
+
+    # For each off-start, check if any HFNO record appears in [off_start, off_start + 48h)
+    _off_with_candidate = _all_off_starts.with_columns(
+        (pl.col("off_start") + pl.duration(hours=48)).alias("candidate_time"),
+    )
+
+    # Cross-join with HFNO records to find any HFNO in the gap window
+    _off_with_hfno_check = (
+        _off_with_candidate
+        .join(_hfno_records, on="hospitalization_id", how="left", suffix="_hfno")
+        .filter(
+            pl.col("recorded_dttm").is_not_null()
+            & (pl.col("recorded_dttm") >= pl.col("off_start"))
+            & (pl.col("recorded_dttm") < pl.col("candidate_time"))
+        )
+        .select(["hospitalization_id", "off_start"])
+        .unique()
+    )
+
+    # Off-starts with NO HFNO in the 48h window = valid 48h-free periods
+    _valid_off = (
+        _off_with_candidate
+        .join(_off_with_hfno_check, on=["hospitalization_id", "off_start"], how="anti")
+    )
+
+    # Validate: patient alive, still in ICU, within 7-day window
+    _valid_off = (
+        _valid_off
+        .join(
+            cohort.select(["hospitalization_id", "icu_end"]),
+            on="hospitalization_id",
+            how="left",
+        )
+        .join(death_by_hosp, on="hospitalization_id", how="left")
+        .filter(
+            # candidate_time within 7-day window
+            (pl.col("candidate_time") <= pl.col("extubation_time") + pl.duration(hours=168))
+            # Still in ICU
+            & (pl.col("candidate_time") <= pl.col("icu_end"))
+            # Alive
+            & (
+                pl.col("death_dttm").is_null()
+                | (pl.col("death_dttm") > pl.col("candidate_time"))
+            )
+        )
+    )
+
+    # Take the earliest valid hfno_free_48h_time per patient
+    _hfno_free_from_hfno = (
+        _valid_off
+        .sort(["hospitalization_id", "candidate_time"])
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("candidate_time").alias("hfno_free_48h_time"),
+        ])
+    )
+
+    # Combine never-HFNO and HFNO-then-free patients
+    hfno_free_48h = pl.concat([_hosp_never_hfno, _hfno_free_from_hfno])
+
     # Combine all event times
     events = (
         cohort.select("hospitalization_id")
@@ -300,6 +481,10 @@ def _(cohort, death_by_hosp, pl, resp):
         .join(nippv_cpap, on="hospitalization_id", how="left")
         .join(death_times, on="hospitalization_id", how="left")
         .join(icu_discharge_alive, on="hospitalization_id", how="left")
+        .join(hfno_free_48h, on="hospitalization_id", how="left")
+        .with_columns(
+            pl.min_horizontal("icu_discharge_alive_time", "hfno_free_48h_time").alias("success_time"),
+        )
     )
 
     print(f"Events summary:")
@@ -307,6 +492,8 @@ def _(cohort, death_by_hosp, pl, resp):
     print(f"  NIPPV/CPAP: {events['nippv_cpap_time'].is_not_null().sum()}")
     print(f"  Death: {events['death_time'].is_not_null().sum()}")
     print(f"  ICU discharge alive: {events['icu_discharge_alive_time'].is_not_null().sum()}")
+    print(f"  HFNO-free 48h: {hfno_free_48h['hfno_free_48h_time'].is_not_null().sum()}")
+    print(f"  Success (discharge OR 48h HFNO-free): {events['success_time'].is_not_null().sum()}")
     return (events,)
 
 
@@ -319,7 +506,7 @@ def _(events, pl, scaffold):
 
     # --- outcome_death_reintubate ---
     # event_time = min(reintubation_time, death_time)
-    # 1 = event in window, 2 = ICU discharge alive in window, 0 = censored
+    # 1 = event in window, 2 = success (ICU discharge alive OR 48h HFNO-free) in window, 0 = censored
     panel_outcomes = panel_outcomes.with_columns(
         pl.min_horizontal("reintubation_time", "death_time").alias("event_time_dr"),
     )
@@ -332,9 +519,9 @@ def _(events, pl, scaffold):
         )
         .then(pl.lit(1))
         .when(
-            pl.col("icu_discharge_alive_time").is_not_null()
-            & (pl.col("icu_discharge_alive_time") >= pl.col("window_start"))
-            & (pl.col("icu_discharge_alive_time") < pl.col("window_end"))
+            pl.col("success_time").is_not_null()
+            & (pl.col("success_time") >= pl.col("window_start"))
+            & (pl.col("success_time") < pl.col("window_end"))
         )
         .then(pl.lit(2))
         .otherwise(pl.lit(0))
@@ -355,9 +542,9 @@ def _(events, pl, scaffold):
         )
         .then(pl.lit(1))
         .when(
-            pl.col("icu_discharge_alive_time").is_not_null()
-            & (pl.col("icu_discharge_alive_time") >= pl.col("window_start"))
-            & (pl.col("icu_discharge_alive_time") < pl.col("window_end"))
+            pl.col("success_time").is_not_null()
+            & (pl.col("success_time") >= pl.col("window_start"))
+            & (pl.col("success_time") < pl.col("window_end"))
         )
         .then(pl.lit(2))
         .otherwise(pl.lit(0))
