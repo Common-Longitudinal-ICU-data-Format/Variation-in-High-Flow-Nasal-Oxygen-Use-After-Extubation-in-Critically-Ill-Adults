@@ -12,9 +12,10 @@ def _():
     import json
     import matplotlib.pyplot as plt
     from pathlib import Path
-    from clifpy.tables import Vitals, HospitalDiagnosis, Patient, MedicationAdminContinuous, Hospitalization
+    from clifpy.tables import Adt, Vitals, HospitalDiagnosis, Patient, MedicationAdminContinuous, Hospitalization
     from clifpy import calculate_cci
     return (
+        Adt,
         HospitalDiagnosis,
         Hospitalization,
         MedicationAdminContinuous,
@@ -82,6 +83,50 @@ def _(Path, pd, pl):
     print(f"Cohort loaded: {len(cohort)} hospitalizations, {len(cohort_patient_ids)} patients")
     print(f"Columns: {cohort.columns}")
     return cohort, cohort_ids, cohort_patient_ids
+
+
+@app.cell
+def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, cohort, cohort_ids, pd, pl):
+    # Load ADT table filtered to cohort ICU stays
+    adt_table = Adt.from_file(
+        data_directory=DATA_DIR,
+        filetype=FILETYPE,
+        timezone=TIMEZONE,
+        filters={"hospitalization_id": cohort_ids, "location_category": ["icu"]},
+    )
+
+    # Convert to pandas, strip timezone, then to polars
+    adt_pd = adt_table.df
+    for _col in adt_pd.select_dtypes(include=["datetimetz"]).columns:
+        adt_pd[_col] = adt_pd[_col].dt.tz_localize(None)
+    adt = pl.from_pandas(adt_pd)
+    del adt_pd
+
+    # Join cohort extubation_time, then find the ADT row containing extubation
+    adt_ext = (
+        adt.join(
+            cohort.select(["hospitalization_id", "extubation_time"]),
+            on="hospitalization_id",
+            how="inner",
+        )
+        .filter(
+            (pl.col("extubation_time") >= pl.col("in_dttm"))
+            & (pl.col("extubation_time") <= pl.col("out_dttm"))
+        )
+        # For ties (overlapping ADT rows), take the latest in_dttm (most specific ICU)
+        .sort("in_dttm", descending=True)
+        .group_by("hospitalization_id")
+        .first()
+        .select([
+            "hospitalization_id",
+            pl.col("location_type").alias("extubation_icu_type"),
+            "hospital_id",
+        ])
+    )
+
+    print(f"ADT extubation ICU mapping: {len(adt_ext)} / {len(cohort)} hospitalizations matched")
+    print(f"  extubation_icu_type values: {adt_ext['extubation_icu_type'].value_counts().sort('count', descending=True)}")
+    return (adt_ext,)
 
 
 @app.cell
@@ -941,7 +986,7 @@ def _(outcomes, pl, vaso_ext):
 
 
 @app.cell
-def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vaso_agg, vitals_agg):
+def _(adt_ext, cci_df, cohort, outcomes, pl, resp_agg, rox, vaso_agg, vitals_agg):
     # Assemble final panel
 
     # Baseline demographics (repeated per window)
@@ -957,6 +1002,7 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vaso_agg, vitals_agg):
         ])
         .join(cci_df, on="hospitalization_id", how="left")
         .rename({"cci_score": "cci"})
+        .join(adt_ext, on="hospitalization_id", how="left")
     )
 
     # Start with outcomes (already truncated)
@@ -1000,6 +1046,8 @@ def _(cci_df, cohort, outcomes, pl, resp_agg, rox, vaso_agg, vitals_agg):
         "cci",
         "bmi",
         "sofa_extubation",
+        "extubation_icu_type",
+        "hospital_id",
         "sf_ratio",
         "sf_spo2",
         "sf_fio2",
@@ -1385,6 +1433,7 @@ def _(cohort, events, pl):
 @app.cell
 def _(
     Path,
+    adt_ext,
     cci_df,
     cohort,
     flat_outcomes,
@@ -1403,6 +1452,7 @@ def _(
             "sofa_extubation",
         ])
         .join(cci_df.rename({"cci_score": "cci"}), on="hospitalization_id", how="left")
+        .join(adt_ext, on="hospitalization_id", how="left")
         .join(j9611_flag, on="hospitalization_id", how="left")
         .join(vaso_windows, on="hospitalization_id", how="left")
         .join(rox_wide, on="hospitalization_id", how="left")
@@ -1424,6 +1474,8 @@ def _(
         "age",
         "sex",
         "cci",
+        "extubation_icu_type",
+        "hospital_id",
         "chronic_resp_failure_hypoxia",
         "sofa_extubation",
         "vasopressor_0_4h",
