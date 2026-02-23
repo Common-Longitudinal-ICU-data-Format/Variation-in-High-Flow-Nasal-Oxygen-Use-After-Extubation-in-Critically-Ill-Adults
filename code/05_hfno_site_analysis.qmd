@@ -898,6 +898,14 @@ df_msm_final <- df_weights
 **Model specification:** Outcome model includes exposure + time spline only. All confounding adjustment (sofa_extubation, age, bmi, time-varying FiO2) is handled by the MSM weights from Section 7. Parsimonious outcome model justified by pilot site elimination analysis and power constraints.
 
 ```{r primary-model}
+# Convert outcomes to factors — multinom's Hessian computation (multinomHess)
+# fails on numeric vectors due to internal dimension mismatch in probs matrix.
+df_msm_final <- df_msm_final %>%
+  mutate(
+    outcome_death_reintubate            = factor(outcome_death_reintubate,            levels = c(0, 1, 2)),
+    outcome_death_reintubate_nippv_cpap = factor(outcome_death_reintubate_nippv_cpap, levels = c(0, 1, 2))
+  )
+
 # 8.1 Unweighted model (conventional — comparator)
 model_unweighted <- nnet::multinom(
   outcome_death_reintubate ~
@@ -1234,6 +1242,7 @@ denom_sd_sf <- summary(denom_model_sf)$sigma
 
 df_weights_sf <- df_weights %>%
   mutate(
+    outcome_death_reintubate = factor(outcome_death_reintubate, levels = c(0, 1, 2)),
     pred_denom_sf = predict(denom_model_sf, newdata = df_weights),
     dens_denom_sf = dnorm(hfno_flow_rate_clean, mean = pred_denom_sf, sd = denom_sd_sf),
     # dens_numer reused from primary model — numerator is invariant across denominator sensitivities by design
