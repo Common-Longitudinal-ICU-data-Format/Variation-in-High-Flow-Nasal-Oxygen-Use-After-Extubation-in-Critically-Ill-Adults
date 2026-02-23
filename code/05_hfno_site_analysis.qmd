@@ -177,6 +177,13 @@ cat("\nBaseline completeness:\n")
 print(baseline_completeness)
 write_csv(baseline_completeness, "../output_to_share/diagnostics/01_baseline_completeness.csv")
 
+
+# Flag BMI missingness early
+if (baseline_completeness$bmi_miss > 0) {
+  warning(baseline_completeness$bmi_miss,
+          " hospitalizations have missing BMI — median imputation applied in weight models.")
+}
+
 ```
 
 ---
@@ -760,13 +767,27 @@ df_weights <- df_msm %>%
                            median(hfno_flow_rate_lag1, na.rm = TRUE),
                            hfno_flow_rate_lag1)
   )
-
+#Impute BMI if needed - same process for missing above 
+df_weights <- df_msm %>%
+  mutate(
+    # existing imputations
+    fio2_lag1_imp = ifelse(is.na(fio2_lag1),
+                           median(fio2_lag1, na.rm = TRUE), fio2_lag1),
+    sf_lag1_imp   = ifelse(is.na(sf_ratio_lag1),
+                           median(sf_ratio_lag1, na.rm = TRUE), sf_ratio_lag1),
+    flow_lag1_imp = ifelse(is.na(hfno_flow_rate_lag1),
+                           median(hfno_flow_rate_lag1, na.rm = TRUE),
+                           hfno_flow_rate_lag1),
+    # new — BMI imputation
+    bmi_imp       = ifelse(is.na(bmi),
+                           median(bmi, na.rm = TRUE), bmi)
+  )
 # 7.2 Denominator model
 denom_model <- lm(
   hfno_flow_rate_clean ~
     flow_lag1_imp +
     ns(window_idx_num, df = 3) +
-    sofa_extubation + age + bmi +
+    sofa_extubation + age + bmi_imp +
     fio2_lag1_imp,
   data = df_weights
 )
@@ -776,7 +797,7 @@ numer_model <- lm(
   hfno_flow_rate_clean ~
     flow_lag1_imp +
     ns(window_idx_num, df = 3) +
-    sofa_extubation + age + bmi,
+    sofa_extubation + age + bmi_imp,
   data = df_weights
 )
 
@@ -1233,7 +1254,7 @@ denom_model_sf <- lm(
   hfno_flow_rate_clean ~
     flow_lag1_imp +
     ns(window_idx_num, df = 3) +
-    sofa_extubation + age + bmi +
+    sofa_extubation + age + bmi_imp +
     sf_lag1_imp,
   data = df_weights
 )
@@ -1252,6 +1273,8 @@ df_weights_sf <- df_weights %>%
   arrange(window_idx_num) %>%
   mutate(w_msm_sf_raw = cumprod(w_interval_sf)) %>%
   ungroup()
+
+# Global quantile truncation (must be outside group_by)
 
 # Global quantile truncation (must be outside group_by)
 sf_p01 <- quantile(df_weights_sf$w_msm_sf_raw, .01, na.rm = TRUE)

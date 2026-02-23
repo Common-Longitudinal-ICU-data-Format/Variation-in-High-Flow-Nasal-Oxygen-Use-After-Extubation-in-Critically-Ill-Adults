@@ -146,6 +146,22 @@ def _(Path, cohort_ids, pd, pl):
     # Filter to cohort
     resp = resp.filter(pl.col("hospitalization_id").is_in(cohort_ids))
 
+    # Normalize FiO2: convert percentage (>1.0) to decimal fraction
+    resp = resp.with_columns(
+        pl.when(pl.col("fio2_set") > 1.0)
+        .then(pl.col("fio2_set") / 100)
+        .otherwise(pl.col("fio2_set"))
+        .alias("fio2_set")
+    )
+
+    # Replace FiO2 outliers outside [0.21, 1.0] with null
+    resp = resp.with_columns(
+        pl.when(pl.col("fio2_set").is_between(0.21, 1.0))
+        .then(pl.col("fio2_set"))
+        .otherwise(None)
+        .alias("fio2_set")
+    )
+
     print(f"Resp waterfall loaded: {len(resp)} rows for {resp['hospitalization_id'].n_unique()} hospitalizations")
     return (resp,)
 

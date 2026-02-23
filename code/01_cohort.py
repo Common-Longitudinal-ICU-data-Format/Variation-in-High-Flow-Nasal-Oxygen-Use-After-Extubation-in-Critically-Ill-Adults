@@ -402,6 +402,22 @@ def _(
     # Convert to Polars
     resp_df = pl.from_pandas(resp_df)
 
+    # Normalize FiO2: convert percentage (>1.0) to decimal fraction
+    resp_df = resp_df.with_columns(
+        pl.when(pl.col("fio2_set") > 1.0)
+        .then(pl.col("fio2_set") / 100)
+        .otherwise(pl.col("fio2_set"))
+        .alias("fio2_set")
+    )
+
+    # Replace FiO2 outliers outside [0.21, 1.0] with null
+    resp_df = resp_df.with_columns(
+        pl.when(pl.col("fio2_set").is_between(0.21, 1.0))
+        .then(pl.col("fio2_set"))
+        .otherwise(None)
+        .alias("fio2_set")
+    )
+
     # HFNO cleanup: reclassify and cap flow rates
     n_before_hfno_clean = resp_df.height
     n_reclassified = resp_df.filter(

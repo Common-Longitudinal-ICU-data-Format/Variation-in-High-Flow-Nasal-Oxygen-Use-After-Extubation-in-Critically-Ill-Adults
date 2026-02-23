@@ -129,23 +129,9 @@ def _(cci_df, cohort, pl):
         .alias("race_ethnicity")
     )
 
-    # ICU type grouped
-    df = df.with_columns(
-        pl.when(pl.col("icu_type").is_in(["cardiac_icu", "cvicu_icu"]))
-        .then(pl.lit("Cardiac"))
-        .when(pl.col("icu_type") == "surgical_icu")
-        .then(pl.lit("Surgical"))
-        .when(pl.col("icu_type").is_in(["medical_icu", "general_icu"]))
-        .then(pl.lit("Medical"))
-        .when(pl.col("icu_type") == "mixed_neuro_icu")
-        .then(pl.lit("Neuro"))
-        .otherwise(pl.lit("Other"))
-        .alias("icu_type_grouped")
-    )
-
     print(f"Derived columns computed. Shape: {df.shape}")
     print(f"Race/ethnicity distribution:\n{df['race_ethnicity'].value_counts().sort('count', descending=True)}")
-    print(f"ICU type distribution:\n{df['icu_type_grouped'].value_counts().sort('count', descending=True)}")
+    print(f"ICU type distribution:\n{df['icu_type'].value_counts().sort('count', descending=True)}")
     return (df,)
 
 
@@ -208,9 +194,9 @@ def _(np, pl):
         stats["SOFA, extubation"] = mean_sd(group_df["sofa_extubation"])
 
         # ICU type subgroups
-        icu_col = group_df["icu_type_grouped"]
-        for cat in ["Cardiac", "Surgical", "Medical", "Neuro"]:
-            stats[f"  {cat} ICU"] = n_pct(icu_col, icu_col == cat)
+        icu_col = group_df["icu_type"]
+        for cat in sorted(icu_col.drop_nulls().unique().to_list()):
+            stats[f"  {cat}"] = n_pct(icu_col, icu_col == cat)
 
         stats["PaCO2 before extubation, mmHg"] = mean_sd(group_df["paco2_pre_extubation"])
 
