@@ -1,5 +1,5 @@
 ---
-title: "HFNO Post-Extubation: Federated MSM Analysis"
+title: "HFNO Post-Extubation"
 subtitle: "Discrete-Time Competing Risks with Marginal Structural Models"
 date: today
 format:
@@ -21,7 +21,7 @@ execute:
 
 # Overview
 
-This document implements the pre-specified federated analysis for the HFNO post-extubation study. Sites should run this document from top to bottom without modification. All outputs are saved to the `output_to_share/` directory for return to the coordinating site.
+This document implements the pre-specified  analysis for the HFNO post-extubation study. Sites should run this document from top to bottom without modification. All outputs are saved to the `output_to_share/` directory for return to the coordinating site.
 
 **Study Design:**
 
@@ -69,14 +69,16 @@ library(nnet)
 library(mclogit)
 library(knitr)
 library(scales)
+install.packages("here")
+library(here)
 
 set.seed(20240101)
 
 # Create output directories
-dir.create("../output_to_share/figures",     showWarnings = FALSE, recursive = TRUE)
-dir.create("../output_to_share/tables",      showWarnings = FALSE, recursive = TRUE)
-dir.create("../output_to_share/diagnostics", showWarnings = FALSE, recursive = TRUE)
-dir.create("../output_to_share/models",      showWarnings = FALSE, recursive = TRUE)
+dir.create(here("../output_to_share/figures"),     showWarnings = FALSE, recursive = TRUE)
+dir.create(here("../output_to_share/tables"),      showWarnings = FALSE, recursive = TRUE)
+dir.create(here("../output_to_share/diagnostics"), showWarnings = FALSE, recursive = TRUE)
+dir.create(here("../output_to_share/models"),      showWarnings = FALSE, recursive = TRUE)
 
 # Load data
 df_raw <- read_parquet("../output/hfno_trajectory.parquet")
@@ -173,10 +175,10 @@ baseline_completeness <- df_raw %>%
     hfno_flow_miss = sum(is.na(hfno_flow_rate))
   )
 
+
 cat("\nBaseline completeness:\n")
 print(baseline_completeness)
-write_csv(baseline_completeness, "../output_to_share/diagnostics/01_baseline_completeness.csv")
-
+write_csv(baseline_completeness, here("../output_to_share/diagnostics/01_baseline_completeness.csv"))
 
 # Flag BMI missingness early
 if (baseline_completeness$bmi_miss > 0) {
@@ -238,7 +240,7 @@ outcome_summary <- final_outcome_lookup %>%
   )
 
 kable(outcome_summary, caption = "Cohort Outcome Distribution and Follow-up Summary")
-write_csv(outcome_summary, "../output_to_share/tables/02_outcome_distribution.csv")
+write_csv(outcome_summary, here("../output_to_share/tables/02_outcome_distribution.csv"))
 
 
 #
@@ -281,7 +283,7 @@ outcome_missingness <- final_outcome_lookup %>%
     .groups    = "drop"
   )
 
-write_csv(outcome_missingness, "../output_to_share/tables/02_outcome_missingness.csv")
+write_csv(outcome_missingness, here("../output_to_share/tables/02_outcome_missingness.csv"))
 # 2.3 Table 1 by outcome
 df_baseline %>%
   select(age, sex, bmi, cci, sofa_extubation,
@@ -310,7 +312,7 @@ df_baseline %>%
   add_overall(last = FALSE) %>%
   bold_labels() %>%
   as_tibble() %>%
-  write_csv("../output_to_share/tables/02_table1_by_outcome.csv")
+  write_csv(here("../output_to_share/tables/02_table1_by_outcome.csv"))
 
 cat("Table 1 saved.\n")
 ```
@@ -337,7 +339,7 @@ df_flow_strat <- df_plot %>%
     .groups   = "drop"
   )
 
-write_csv(df_flow_strat, "../output_to_share/tables/03_hfno_trajectory_data.csv")
+write_csv(df_flow_strat, here("../output_to_share/tables/03_hfno_trajectory_data.csv"))
 
 p_flow <- ggplot(df_flow_strat,
                  aes(x = window_idx, y = mean_flow,
@@ -370,7 +372,7 @@ p_atrisk <- df_plot %>%
   theme(panel.grid.minor = element_blank())
 
 p_flow_combined <- p_flow / p_atrisk + plot_layout(heights = c(4, 1))
-ggsave("../output_to_share/figures/03_hfno_over_time.png",
+ggsave(here("../output_to_share/figures/03_hfno_over_time.png"),
        plot = p_flow_combined, width = 11, height = 7.5, dpi = 300)
 p_flow_combined
 
@@ -385,7 +387,7 @@ df_fio2_strat <- df_plot %>%
     .groups = "drop"
   )
 
-write_csv(df_fio2_strat, "../output_to_share/tables/03_fio2_trajectory_data.csv")
+write_csv(df_fio2_strat, here("../output_to_share/tables/03_fio2_trajectory_data.csv"))
 
 p_fio2 <- ggplot(df_fio2_strat,
                  aes(x = window_idx, y = mean_fio2,
@@ -404,7 +406,7 @@ p_fio2 <- ggplot(df_fio2_strat,
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
 
-ggsave("../output_to_share/figures/03_fio2_over_time.png", plot = p_fio2,
+ggsave(here("../output_to_share/figures/03_fio2_over_time.png"), plot = p_fio2,
        width = 11, height = 6, dpi = 300)
 p_fio2
 
@@ -419,7 +421,7 @@ df_sf_strat <- df_plot %>%
     .groups = "drop"
   )
 
-write_csv(df_sf_strat, "../output_to_share/tables/03_sf_trajectory_data.csv")
+write_csv(df_sf_strat, here("../output_to_share/tables/03_sf_trajectory_data.csv"))
 
 p_sf <- ggplot(df_sf_strat,
                aes(x = window_idx, y = mean_sf,
@@ -438,7 +440,7 @@ p_sf <- ggplot(df_sf_strat,
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank())
 
-ggsave("../output_to_share/figures/03_sf_over_time.png", plot = p_sf,
+ggsave(here("../output_to_share/figures/03_sf_over_time.png"), plot = p_sf,
        width = 11, height = 6, dpi = 300)
 p_sf
 
@@ -470,11 +472,11 @@ p_baseline <- df_baseline %>%
         strip.text  = element_text(face = "bold"),
         axis.text.x = element_text(angle = 25, hjust = 1))
 
-ggsave("../output_to_share/figures/03_baseline_characteristics.png", plot = p_baseline,
+ggsave(here("../output_to_share/figures/03_baseline_characteristics.png"), plot = p_baseline,
        width = 12, height = 8, dpi = 300)
 p_baseline
 
-# 3.5 Overall HFNO trajectory (for federated overlay)
+# 3.5 Overall HFNO trajectory
 df_flow_overall <- df_raw %>%
   filter(!is.na(hfno_flow_rate)) %>%
   group_by(window_idx) %>%
@@ -483,7 +485,7 @@ df_flow_overall <- df_raw %>%
             lci = mean_flow - 1.96 * se, uci = mean_flow + 1.96 * se,
             .groups = "drop")
 
-write_csv(df_flow_overall, "../output_to_share/tables/03_hfno_spline_data.csv")
+write_csv(df_flow_overall, here("../output_to_share/tables/03_hfno_spline_data.csv"))
 
 # Unstratified FiO2 trajectory (parallel to 03_hfno_spline_data)
 df_fio2_overall <- df_raw %>%
@@ -495,7 +497,7 @@ df_fio2_overall <- df_raw %>%
             uci = mean_fio2 + 1.96 * se,
             .groups = "drop")
 
-write_csv(df_fio2_overall, "../output_to_share/tables/03_fio2_overall_data.csv")
+write_csv(df_fio2_overall, here("../output_to_share/tables/03_fio2_overall_data.csv"))
 
 # Unstratified S/F trajectory
 df_sf_overall <- df_raw %>%
@@ -507,7 +509,7 @@ df_sf_overall <- df_raw %>%
             uci = mean_sf + 1.96 * se,
             .groups = "drop")
 
-write_csv(df_sf_overall, "../output_to_share/tables/03_sf_overall_data.csv")
+write_csv(df_sf_overall, here("../output_to_share/tables/03_sf_overall_data.csv"))
 
 ```
 
@@ -625,7 +627,7 @@ events_by_window <- df_msm %>%
     .groups   = "drop"
   )
 
-write_csv(events_by_window, "../output_to_share/tables/05_events_by_window.csv")
+write_csv(events_by_window, here("../output_to_share/tables/05_events_by_window.csv"))
 
 p_events <- df_msm %>%
   filter(outcome_death_reintubate %in% c(1, 2)) %>%
@@ -654,7 +656,7 @@ p_events <- df_msm %>%
         panel.grid.minor = element_blank(),
         legend.position = "bottom")
 
-ggsave("../output_to_share/figures/05_events_by_window.png",
+ggsave(here("../output_to_share/figures/05_events_by_window.png"),
        plot = p_events, width = 10, height = 5, dpi = 300)
 p_events
 ```
@@ -675,7 +677,7 @@ p_baseline_dist <- df_baseline %>%
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"), legend.position = "bottom")
 
-ggsave("../output_to_share/figures/06_baseline_hfno_distribution.png",
+ggsave(here("../output_to_share/figures/06_baseline_hfno_distribution.png"),
        plot = p_baseline_dist, width = 8, height = 5, dpi = 300)
 p_baseline_dist
 
@@ -690,8 +692,8 @@ cor_table <- df_baseline %>%
 
 write_csv(
   as_tibble(cor_table, rownames = "variable"),
-  "../output_to_share/tables/06_correlation_matrix.csv"
-)
+  here("../output_to_share/tables/06_correlation_matrix.csv"
+))
 
 cat("Correlation of confounders with HFNO flow rate (justifies MSM):\n")
 print(cor_table["hfno_flow_rate", , drop = FALSE])
@@ -729,9 +731,9 @@ p_hfno_sf <- df_baseline %>%
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"), legend.position = "top")
 
-ggsave("../output_to_share/figures/06_baseline_hfno_vs_fio2.png", plot = p_hfno_fio2,
+ggsave(here("../output_to_share/figures/06_baseline_hfno_vs_fio2.png"), plot = p_hfno_fio2,
        width = 9, height = 6, dpi = 300)
-ggsave("../output_to_share/figures/06_baseline_hfno_vs_sf.png",   plot = p_hfno_sf,
+ggsave(here("../output_to_share/figures/06_baseline_hfno_vs_sf.png"),   plot = p_hfno_sf,
        width = 9, height = 6, dpi = 300)
 
 p_hfno_fio2 + p_hfno_sf
@@ -874,7 +876,7 @@ ess_by_window <- df_weights %>%
     .groups  = "drop"
   )
 
-write_csv(ess_by_window, "../output_to_share/models/07_weight_diagnostics.csv")
+write_csv(ess_by_window, here("../output_to_share/models/07_weight_diagnostics.csv"))
 ```
 
 ```{r weight-plot, fig.height=5}
@@ -889,7 +891,7 @@ p_weights <- ggplot(df_weights, aes(x = w_msm_raw)) +
   theme_minimal(base_size = 13) +
   theme(plot.title = element_text(face = "bold"))
 
-ggsave("../output_to_share/figures/07_weight_distribution.png",
+ggsave(here("../output_to_share/figures/07_weight_distribution.png"),
        plot = p_weights, width = 8, height = 5, dpi = 300)
 p_weights
 
@@ -907,13 +909,12 @@ weight_distribution_export <- df_weights %>%
     max_trunc  = round(max(w_msm_trunc,  na.rm = TRUE), 4)
   )
 
-write_csv(weight_distribution_export, "../output_to_share/models/07_weight_distribution.csv")
+write_csv(weight_distribution_export, here("../output_to_share/models/07_weight_distribution.csv"))
 
 df_msm_final <- df_weights
 ```
 
 ---
-
 # Section 8 — Primary Outcome Model
 
 **Model specification:** Outcome model includes exposure + time spline only. All confounding adjustment (sofa_extubation, age, bmi, time-varying FiO2) is handled by the MSM weights from Section 7. Parsimonious outcome model justified by pilot site elimination analysis and power constraints.
@@ -921,31 +922,46 @@ df_msm_final <- df_weights
 ```{r primary-model}
 # Convert outcomes to factors — multinom's Hessian computation (multinomHess)
 # fails on numeric vectors due to internal dimension mismatch in probs matrix.
+# Applied here so factor state is consistent across df_msm_final, df_weights, and df_weights_sf
 df_msm_final <- df_msm_final %>%
   mutate(
     outcome_death_reintubate            = factor(outcome_death_reintubate,            levels = c(0, 1, 2)),
     outcome_death_reintubate_nippv_cpap = factor(outcome_death_reintubate_nippv_cpap, levels = c(0, 1, 2))
   )
 
+df_weights <- df_weights %>%
+  mutate(
+    outcome_death_reintubate            = factor(outcome_death_reintubate,            levels = c(0, 1, 2)),
+    outcome_death_reintubate_nippv_cpap = factor(outcome_death_reintubate_nippv_cpap, levels = c(0, 1, 2))
+  )
+
 # 8.1 Unweighted model (conventional — comparator)
+df_model <- df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1))
+
+cat("Rows entering outcome model:", nrow(df_model), "\n")
+cat("Non-missing weights:", sum(!is.na(df_model$w_msm_trunc)), "\n")
+
 model_unweighted <- nnet::multinom(
   outcome_death_reintubate ~
     hfno_flow_rate_lag1 +
     ns(window_idx_num, df = 3),
-  data  = df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1)),
+  data  = df_model,
   trace = FALSE
 )
 
 coef_unweighted <- summary(model_unweighted)$coefficients
 se_unweighted   <- summary(model_unweighted)$standard.errors
 
+# Confirm row names after factoring — should be "1" and "2"
+cat("Coefficient row names:", rownames(coef_unweighted), "\n")
+
 # 8.2 Weighted model (MSM causal estimate)
 model_weighted <- nnet::multinom(
   outcome_death_reintubate ~
     hfno_flow_rate_lag1 +
     ns(window_idx_num, df = 3),
-  data    = df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1)),
-  weights = w_msm_trunc,
+  data    = df_model,
+  weights = df_model$w_msm_trunc,
   trace   = FALSE
 )
 
@@ -977,7 +993,7 @@ full_coef_weighted <- as_tibble(coef_weighted, rownames = "outcome") %>%
          or_lower = exp(coef - 1.96 * se),
          or_upper = exp(coef + 1.96 * se))
 
-# 8.4 Primary results table (key federated deliverable)
+# 8.4 Primary results table (key deliverable)
 results_comparison <- tibble(
   outcome = c("Failure (Reintubation/Death)", "Failure (Reintubation/Death)",
               "Discharge Alive",              "Discharge Alive"),
@@ -1002,13 +1018,15 @@ results_comparison <- tibble(
   mutate(across(where(is.numeric), ~ round(.x, 3)))
 
 kable(results_comparison, caption = "Primary Results: OR per 10 L/min Increase in HFNO Flow Rate")
-write_csv(results_comparison,   "../output_to_share/models/08_model3_exposure_effect.csv")
-write_csv(full_coef_unweighted, "../output_to_share/models/08_model3_unweighted_full.csv")
-write_csv(full_coef_weighted,   "../output_to_share/models/08_model3_weighted_full.csv")
+write_csv(results_comparison,   here("../output_to_share/models/08_model3_exposure_effect.csv"))
+write_csv(full_coef_unweighted, here("../output_to_share/models/08_model3_unweighted_full.csv"))
+write_csv(full_coef_weighted,   here("../output_to_share/models/08_model3_weighted_full.csv"))
 ```
 
 ---
+
 # Section 9 — Clustering Adjustment
+
 ```{r clustering}
 # Safe default — overwritten by each branch below
 clustering_method <- "Unknown — check clustering detection"
@@ -1039,6 +1057,15 @@ cat("Clustering structure at this site:\n")
 cat("  Hospitals:", n_hospitals, "\n")
 cat("  ICU types:", n_icus,      "\n")
 
+# Create aligned clustering dataset — filtered and factored consistently
+df_cluster <- df_msm_final %>%
+  filter(!is.na(hfno_flow_rate_lag1),
+         !is.na(hospital_id),
+         !is.na(extubation_icu_type)) %>%
+  mutate(outcome_death_reintubate = factor(outcome_death_reintubate, levels = c(0, 1, 2)))
+
+cat("Rows entering clustering model:", nrow(df_cluster), "\n")
+
 # 9.2 Fit clustering-adjusted model
 if (n_hospitals == 1 & n_icus == 1) {
 
@@ -1055,12 +1082,8 @@ if (n_hospitals == 1 & n_icus == 1) {
         hfno_flow_rate_lag1 +
         ns(window_idx_num, df = 3),
       random  = ~ 1 | extubation_icu_type,
-data = df_msm_final %>% 
-  filter(!is.na(hfno_flow_rate_lag1),
-         !is.na(hospital_id),
-         !is.na(extubation_icu_type)) %>%
-  mutate(outcome_death_reintubate = factor(outcome_death_reintubate)),
-      weights = w_msm_trunc
+      data    = df_cluster,
+      weights = df_cluster$w_msm_trunc
     )
   }, error = function(e) {
     cat("mblogit failed:", conditionMessage(e), "\n")
@@ -1078,12 +1101,8 @@ data = df_msm_final %>%
         hfno_flow_rate_lag1 +
         ns(window_idx_num, df = 3),
       random  = ~ 1 | hospital_id / extubation_icu_type,
-     data = df_msm_final %>% 
-  filter(!is.na(hfno_flow_rate_lag1),
-         !is.na(hospital_id),
-         !is.na(extubation_icu_type)) %>%
-  mutate(outcome_death_reintubate = factor(outcome_death_reintubate)),
-      weights = w_msm_trunc
+      data    = df_cluster,
+      weights = df_cluster$w_msm_trunc
     )
   }, error = function(e) {
     cat("Nested mblogit failed:", conditionMessage(e), "\n")
@@ -1094,12 +1113,8 @@ data = df_msm_final %>%
           hfno_flow_rate_lag1 +
           ns(window_idx_num, df = 3),
         random  = ~ 1 | hospital_id,
-       data = df_msm_final %>% 
-  filter(!is.na(hfno_flow_rate_lag1),
-         !is.na(hospital_id),
-         !is.na(extubation_icu_type)) %>%
-  mutate(outcome_death_reintubate = factor(outcome_death_reintubate)),
-        weights = w_msm_trunc
+        data    = df_cluster,
+        weights = df_cluster$w_msm_trunc
       )
     }, error = function(e2) {
       cat("Hospital-only mblogit also failed:", conditionMessage(e2), "\n")
@@ -1115,7 +1130,6 @@ if (!exists("model_final")) {
   model_final       <- model_weighted
   clustering_method <- "Fallback — model_final not created; using primary weighted model"
 }
-
 
 # 9.3 Extract clustering-adjusted results
 if (n_hospitals == 1 & n_icus == 1) {
@@ -1141,7 +1155,8 @@ if (n_hospitals == 1 & n_icus == 1) {
 }
 
 kable(results_final, caption = "Clustering-Adjusted Results")
-write_csv(results_final, "../output_to_share/models/09_clustering_adjusted_results.csv")
+write_csv(results_final, here("../output_to_share/models/09_clustering_adjusted_results.csv"))
+
 # 9.4 ICC (only when random effects model was fitted)
 if (n_hospitals > 1 | n_icus > 1) {
   tryCatch({
@@ -1163,7 +1178,7 @@ if (n_hospitals > 1 | n_icus > 1) {
       icc_out <- bind_rows(icc_rows)
       print(icc_out)
       cat("ICC > 0.05 indicates meaningful clustering warranting random effects.\n")
-      write_csv(icc_out, "../output_to_share/models/09_icc.csv")
+      write_csv(icc_out, here("../output_to_share/models/09_icc.csv"))
 
     } else {
       cat("model_final is not an mblogit object (fallback to multinom fired) — ICC not applicable.\n")
@@ -1172,7 +1187,7 @@ if (n_hospitals > 1 | n_icus > 1) {
                var_intercept     = NA,
                icc               = NA,
                clustering_method = clustering_method),
-        "output_to_share/models/09_icc.csv"
+        here("../output_to_share/models/09_icc.csv")
       )
     }
 
@@ -1181,9 +1196,7 @@ if (n_hospitals > 1 | n_icus > 1) {
     cat("Run str(model_final$VarCov) manually to inspect variance components.\n")
   })
 }
-
 ```
-
 
 ---
 
@@ -1202,8 +1215,8 @@ model_secondary <- nnet::multinom(
   outcome_death_reintubate_nippv_cpap ~
     hfno_flow_rate_lag1 +
     ns(window_idx_num, df = 2),
-  data    = df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1)),
-  weights = w_msm_trunc,
+  data    = df_model,
+  weights = df_model$w_msm_trunc,
   trace   = FALSE
 )
 
@@ -1219,7 +1232,7 @@ secondary_results <- tidy(model_secondary) %>%
   select(sensitivity, y.level, or_per_10lpm, or_lower, or_upper, p_value)
 
 kable(secondary_results, caption = "10.1 Secondary Outcome Sensitivity")
-write_csv(secondary_results, "../output_to_share/models/10_sensitivity_secondary_outcome.csv")
+write_csv(secondary_results, here("../output_to_share/models/10_sensitivity_secondary_outcome.csv"))
 ```
 
 ```{r sensitivity-untruncated}
@@ -1228,8 +1241,8 @@ model_untruncated <- nnet::multinom(
   outcome_death_reintubate ~
     hfno_flow_rate_lag1 +
     ns(window_idx_num, df = 3),
-  data    = df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1)),
-  weights = w_msm_raw,
+  data    = df_model,
+  weights = df_model$w_msm_raw,
   trace   = FALSE
 )
 
@@ -1245,7 +1258,7 @@ untrunc_results <- tidy(model_untruncated) %>%
   select(sensitivity, y.level, or_per_10lpm, or_lower, or_upper, p_value)
 
 kable(untrunc_results, caption = "10.2 Untruncated Weights Sensitivity")
-write_csv(untrunc_results, "../output_to_share/models/10_sensitivity_untruncated_weights.csv")
+write_csv(untrunc_results, here("../output_to_share/models/10_sensitivity_untruncated_weights.csv"))
 ```
 
 ```{r sensitivity-sf}
@@ -1261,9 +1274,9 @@ denom_model_sf <- lm(
 
 denom_sd_sf <- summary(denom_model_sf)$sigma
 
+# df_weights already has outcome factored from Section 8
 df_weights_sf <- df_weights %>%
   mutate(
-    outcome_death_reintubate = factor(outcome_death_reintubate, levels = c(0, 1, 2)),
     pred_denom_sf = predict(denom_model_sf, newdata = df_weights),
     dens_denom_sf = dnorm(hfno_flow_rate_clean, mean = pred_denom_sf, sd = denom_sd_sf),
     # dens_numer reused from primary model — numerator is invariant across denominator sensitivities by design
@@ -1275,21 +1288,21 @@ df_weights_sf <- df_weights %>%
   ungroup()
 
 # Global quantile truncation (must be outside group_by)
-
-# Global quantile truncation (must be outside group_by)
 sf_p01 <- quantile(df_weights_sf$w_msm_sf_raw, .01, na.rm = TRUE)
 sf_p99 <- quantile(df_weights_sf$w_msm_sf_raw, .99, na.rm = TRUE)
 
 df_weights_sf <- df_weights_sf %>%
   mutate(w_msm_sf_trunc = pmin(pmax(w_msm_sf_raw, sf_p01), sf_p99))
 
+# Aligned dataset for SF sensitivity model
+df_model_sf <- df_weights_sf %>% filter(!is.na(hfno_flow_rate_lag1))
 
 model_sf_confounder <- nnet::multinom(
   outcome_death_reintubate ~
     hfno_flow_rate_lag1 +
     ns(window_idx_num, df = 3),
-  data    = df_weights_sf %>% filter(!is.na(hfno_flow_rate_lag1)),
-  weights = w_msm_sf_trunc,
+  data    = df_model_sf,
+  weights = df_model_sf$w_msm_sf_trunc,
   trace   = FALSE
 )
 
@@ -1305,7 +1318,7 @@ sf_results <- tidy(model_sf_confounder) %>%
   select(sensitivity, y.level, or_per_10lpm, or_lower, or_upper, p_value)
 
 kable(sf_results, caption = "10.3 SF Ratio as TV Confounder Sensitivity")
-write_csv(sf_results, "../output_to_share/models/10_sensitivity_sf_confounder.csv")
+write_csv(sf_results, here("../output_to_share/models/10_sensitivity_sf_confounder.csv"))
 ```
 
 ```{r sensitivity-spline}
@@ -1314,8 +1327,8 @@ model_spline <- nnet::multinom(
   outcome_death_reintubate ~
     ns(hfno_flow_rate_lag1, df = 3) +
     ns(window_idx_num, df = 3),
-  data    = df_msm_final %>% filter(!is.na(hfno_flow_rate_lag1)),
-  weights = w_msm_trunc,
+  data    = df_model,
+  weights = df_model$w_msm_trunc,
   trace   = FALSE
 )
 
@@ -1325,7 +1338,7 @@ spline_results <- tidy(model_spline) %>%
          sensitivity = "Spline on continuous exposure")
 
 kable(spline_results, caption = "10.4 Nonlinearity Test (Spline on Exposure)")
-write_csv(spline_results, "../output_to_share/models/10_sensitivity_spline_exposure.csv")
+write_csv(spline_results, here("../output_to_share/models/10_sensitivity_spline_exposure.csv"))
 ```
 
 ---
@@ -1333,8 +1346,10 @@ write_csv(spline_results, "../output_to_share/models/10_sensitivity_spline_expos
 # Session Info
 
 ```{r session-info}
-writeLines(capture.output(sessionInfo()), "../output_to_share/session_info.txt")
+writeLines(capture.output(sessionInfo()), here("../output_to_share/session_info.txt"))
 sessionInfo()
+```
+
 ```
 
 ---
