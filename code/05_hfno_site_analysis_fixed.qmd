@@ -1254,7 +1254,7 @@ denom_model_sf <- lm(
   hfno_flow_rate_clean ~
     flow_lag1_imp +
     ns(window_idx_num, df = 3) +
-    sofa_extubation + age + bmi +
+    sofa_extubation + age + bmi_imp +
     sf_lag1_imp,
   data = df_weights
 )
@@ -1273,6 +1273,8 @@ df_weights_sf <- df_weights %>%
   arrange(window_idx_num) %>%
   mutate(w_msm_sf_raw = cumprod(w_interval_sf)) %>%
   ungroup()
+
+# Global quantile truncation (must be outside group_by)
 
 # Global quantile truncation (must be outside group_by)
 sf_p01 <- quantile(df_weights_sf$w_msm_sf_raw, .01, na.rm = TRUE)

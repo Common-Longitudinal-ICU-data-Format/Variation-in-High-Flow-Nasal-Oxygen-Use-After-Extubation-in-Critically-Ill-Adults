@@ -5,3 +5,6 @@ output/
 output_to_share/
 clif_config.json
 run_all1.sh
+.Rproj.user
+.DS_Store
+Variation-in-High-Flow-Nasal-Oxygen-Use-After-Extubation-in-Critically-Ill-Adults.Rproj
