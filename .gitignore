@@ -3,6 +3,7 @@
 __marimo__/
 output/
 output_to_share/
+output_to_agg/
 clif_config.json
 run_all1.sh
 .Rproj.user
