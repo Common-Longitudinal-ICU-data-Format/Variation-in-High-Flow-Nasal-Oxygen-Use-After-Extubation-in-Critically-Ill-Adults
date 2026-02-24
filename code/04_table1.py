@@ -189,7 +189,8 @@ def _(np, pl):
         for cat in ["Hispanic", "Non-Hispanic White", "Non-Hispanic Black", "Non-Hispanic Asian", "Other", "Not Reported"]:
             stats[f"  {cat}"] = n_pct(re_col, re_col == cat)
 
-        stats["Charlson Comorbidity Index"] = mean_sd(group_df["cci_score"])
+        stats["Charlson Comorbidity Index, mean (SD)"] = mean_sd(group_df["cci_score"])
+        stats["Charlson Comorbidity Index, median [IQR]"] = median_iqr(group_df["cci_score"])
         stats["SOFA, ICU admission"] = mean_sd(group_df["sofa_icu_admission"])
         stats["SOFA, extubation"] = mean_sd(group_df["sofa_extubation"])
 
