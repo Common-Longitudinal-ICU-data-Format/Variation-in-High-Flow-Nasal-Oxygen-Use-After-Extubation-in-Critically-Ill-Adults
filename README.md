@@ -66,6 +66,7 @@ bash run_all.sh
 **Windows (PowerShell):**
 
 ``` powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ./run_all.ps1
 ```
 
