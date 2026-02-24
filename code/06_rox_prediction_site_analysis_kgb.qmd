@@ -1,0 +1,1897 @@
+---
+title: "ROX Index as Predictor of Post-Extubation ICU Outcomes"
+subtitle: "Federated Predictive Analysis — Site-Level Script"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    code-fold: true
+    code-summary: "Show code"
+    theme: cosmo
+    embed-resources: true
+    fig-width: 11
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+  echo: true
+---
+
+# Overview
+
+This document implements analysis examining the ROX index as a predictor of post-extubation ICU outcomes. Sites should run this document from top to bottom without modification. All outputs are saved to the `output_to_share/` directory for return to the coordinating site.
+
+**Study Design:**
+
+- **Predictor:** ROX index (SpO₂/FiO₂ / Respiratory Rate), measured at 4h, 8h, and 12h post-extubation using worst-case values within each window (minimum SpO₂, maximum FiO₂, maximum RR)
+- **Outcomes (8 total):** Extubation success/failure at 3-day and 7-day horizons, under two definitions (standard and strict); death or reintubation at 12h and 24h, under two definitions (standard and with NIPPV/CPAP)
+- **Method:** Logistic regression with cluster-robust standard errors; AUROC comparison across timepoints; 
+**Required data file:** `rox_prediction.parquet` in the `output/` directory
+
+**Required variables:**
+
+| Variable | Description |
+|---|---|
+| `hospitalization_id` | Unique hospitalization identifier |
+| `age` | Age at admission (years) |
+| `sex` | Sex category |
+| `cci` | Charlson Comorbidity Index |
+| `sofa_extubation` | SOFA score in 24h prior to extubation |
+| `chronic_resp_failure_hypoxia` | Prior ICD-10 J96.11 diagnosis (boolean) |
+| `vasopressor_0_4h` | Vasopressor use, 0–4h post-extubation (boolean) |
+| `vasopressor_4_8h` | Vasopressor use, 4–8h post-extubation (boolean) |
+| `vasopressor_8_12h` | Vasopressor use, 8–12h post-extubation (boolean) |
+| `rox_0_4h` | ROX index, 0–4h window (nullable) |
+| `rox_4_8h` | ROX index, 4–8h window (nullable) |
+| `rox_8_12h` | ROX index, 8–12h window (nullable) |
+| `extubation_success_3d` | Extubation success within 3 days — no reintubation, no death |
+| `extubation_success_strict_3d` | Extubation success within 3 days — no reintubation, no death, no NIPPV/CPAP |
+| `extubation_success_7d` | Extubation success within 7 days — no reintubation, no death |
+| `extubation_success_strict_7d` | Extubation success within 7 days — no reintubation, no death, no NIPPV/CPAP |
+| `death_or_reintubation_12h` | Death or reintubation within 12 hours post-extubation |
+| `death_or_reintubation_nippv_cpap_12h` | Death or reintubation or NIPPV/CPAP within 12 hours post-extubation |
+| `death_or_reintubation_24h` | Death or reintubation within 24 hours post-extubation |
+| `death_or_reintubation_nippv_cpap_24h` | Death or reintubation or NIPPV/CPAP within 24 hours post-extubation |
+| `hospital_id` | Facility identifier (set to a constant string if single-site) |
+
+---
+
+# Section 0 — Setup
+
+```{r setup}
+library(tidyverse)
+library(arrow)
+library(gtsummary)
+library(pROC)
+library(lmtest)
+library(sandwich)
+library(survival)
+library(patchwork)
+library(knitr)
+library(scales)
+library(broom)
+
+set.seed(20240101)
+
+# ── Output directories ──────────────────────────────────────────────────────
+dir.create("../output_to_share/rox/figures",     showWarnings = FALSE, recursive = TRUE)
+dir.create("../output_to_share/rox/tables",      showWarnings = FALSE, recursive = TRUE)
+dir.create("../output_to_share/rox/diagnostics", showWarnings = FALSE, recursive = TRUE)
+dir.create("../output_to_share/rox/models",      showWarnings = FALSE, recursive = TRUE)
+
+# ── Load data ────────────────────────────────────────────────────────────────
+df_raw <- read_parquet("../output/rox_prediction.parquet")
+
+# ── Global constants ─────────────────────────────────────────────────────────
+# ROX thresholds from published literature
+ROX_ROCA_2016        <- 4.88   # Roca et al. 2016, J Crit Care — original derivation (pneumonia/ARF)
+ROX_POST_EXTUBATION  <- 8.70   # Post-extubation literature threshold (e.g., 2h/6h windows)
+
+# Named ROX windows (timepoint labels used throughout)
+rox_windows <- c("4h" = "rox_0_4h", "8h" = "rox_4_8h", "12h" = "rox_8_12h")
+
+# Outcome definitions — used to loop over all 8 outcomes (chronological order)
+# "strict" = no death, no reintubation, AND no NIPPV/CPAP (NIPPV/CPAP counts as failure)
+# "non-strict" = no death, no reintubation (NIPPV/CPAP allowed as success)
+outcome_defs <- tibble(
+  outcome_var   = c("extubation_success_strict_12h", "extubation_success_12h",
+                     "extubation_success_strict_24h", "extubation_success_24h",
+                     "extubation_success_strict_3d",  "extubation_success_3d",
+                     "extubation_success_strict_7d",  "extubation_success_7d"),
+  outcome_label = c("Extubation Failure+NIPPV/CPAP 12h", "Extubation Failure 12h",
+                     "Extubation Failure+NIPPV/CPAP 24h", "Extubation Failure 24h",
+                     "Extubation Failure+NIPPV/CPAP 3d",  "Extubation Failure 3d",
+                     "Extubation Failure+NIPPV/CPAP 7d",  "Extubation Failure 7d"),
+  horizon       = c("12h", "12h", "24h", "24h", "3d", "3d", "7d", "7d"),
+  strict        = c(TRUE, FALSE, TRUE, FALSE, TRUE, FALSE, TRUE, FALSE)
+)
+
+# Corresponding vasopressor column for each ROX window
+vaso_for_window <- c("4h" = "vasopressor_0_4h", "8h" = "vasopressor_4_8h", "12h" = "vasopressor_8_12h")
+# ── TEMPORARY: dummy hospital_id for single-site pilot testing ─────────────
+# Remove or comment out before distributing to sites
+if (!"hospital_id" %in% names(df_raw)) {
+  df_raw <- df_raw %>% mutate(hospital_id = "PILOT_SITE")
+  cat("NOTE: hospital_id not found — dummy variable 'PILOT_SITE' created for testing.\n")
+}
+cat("Data loaded:", nrow(df_raw), "rows,",
+    n_distinct(df_raw$hospitalization_id), "hospitalizations\n")
+cat("Sites:", n_distinct(df_raw$hospital_id), "\n")
+```
+
+---
+
+# Section 1 — Data Quality and Missingness
+
+```{r data-quality}
+# ── 1.1 Structure ─────────────────────────────────────────────────────────
+cat("Rows:", nrow(df_raw), "\n")
+cat("Columns:", ncol(df_raw), "\n")
+cat("Unique hospitalizations:", n_distinct(df_raw$hospitalization_id), "\n")
+cat("Unique hospitals:", n_distinct(df_raw$hospital_id), "\n")
+
+# ── 1.2 Duplicate check — expect 0 ────────────────────────────────────────
+dups <- df_raw %>% group_by(hospitalization_id) %>% filter(n() > 1)
+if (nrow(dups) > 0) {
+  warning(nrow(dups), " duplicate hospitalization_id rows detected. Review before proceeding.")
+  print(dups)
+} else {
+  cat("Duplicate check: PASS\n")
+}
+
+# ── 1.3 Outcome completeness ──────────────────────────────────────────────
+cat("\nOutcome variable missingness:\n")
+outcome_miss <- df_raw %>%
+  summarise(
+    across(starts_with("extubation_success"), ~ sum(is.na(.x))),
+    across(c(extubation_success_strict_12h, extubation_success_12h,
+                   extubation_success_strict_24h, extubation_success_24h), ~ sum(is.na(.x)))
+  ) %>%
+  pivot_longer(everything(), names_to = "outcome", values_to = "n_missing")
+print(outcome_miss)
+
+# ── 1.4 ROX missingness by window ─────────────────────────────────────────
+rox_miss <- df_raw %>%
+  summarise(
+    n_total      = n(),
+    rox_4h_miss  = sum(is.na(rox_0_4h)),
+    rox_8h_miss  = sum(is.na(rox_4_8h)),
+    rox_12h_miss = sum(is.na(rox_8_12h)),
+    rox_4h_pct   = round(rox_4h_miss  / n_total * 100, 1),
+    rox_8h_pct   = round(rox_8h_miss  / n_total * 100, 1),
+    rox_12h_pct  = round(rox_12h_miss / n_total * 100, 1)
+  )
+
+cat("\nROX index missingness by window:\n")
+print(rox_miss)
+
+# ── 1.5 Covariate completeness ────────────────────────────────────────────
+covariate_miss <- df_raw %>%
+  summarise(
+    n              = n(),
+    age_miss       = sum(is.na(age)),
+    sex_miss       = sum(is.na(sex)),
+    cci_miss       = sum(is.na(cci)),
+    sofa_miss      = sum(is.na(sofa_extubation)),
+    chr_resp_miss  = sum(is.na(chronic_resp_failure_hypoxia)),
+    vaso_4h_miss   = sum(is.na(vasopressor_0_4h)),
+    vaso_8h_miss   = sum(is.na(vasopressor_4_8h)),
+    vaso_12h_miss  = sum(is.na(vasopressor_8_12h))
+  )
+
+cat("\nCovariate completeness (n missing):\n")
+print(covariate_miss)
+
+# ── 1.6 ROX missingness by outcome group ─────────────────────────────────
+# Flags if missingness is differential — important for complete-case validity
+rox_miss_by_outcome <- df_raw %>%
+  mutate(
+    outcome_group = case_when(
+       extubation_success_7d == TRUE  ~ "Success (7d)",
+       extubation_success_7d == FALSE ~ "Failure (7d)",
+       TRUE                           ~ "Unknown"
+    )
+  ) %>%
+  group_by(outcome_group) %>%
+  summarise(
+    n             = n(),
+    rox_4h_miss   = sum(is.na(rox_0_4h)),
+    rox_8h_miss   = sum(is.na(rox_4_8h)),
+    rox_12h_miss  = sum(is.na(rox_8_12h)),
+    rox_4h_pct    = round(rox_4h_miss  / n * 100, 1),
+    rox_8h_pct    = round(rox_8h_miss  / n * 100, 1),
+    rox_12h_pct   = round(rox_12h_miss / n * 100, 1),
+    .groups = "drop"
+  )
+
+cat("\nROX missingness by 7-day outcome group (flag if differential):\n")
+print(rox_miss_by_outcome)
+
+# ── 1.7 ROX missingness by site ───────────────────────────────────────────
+rox_miss_by_site <- df_raw %>%
+  group_by(hospital_id) %>%
+  summarise(
+    n             = n(),
+    rox_4h_pct    = round(sum(is.na(rox_0_4h))  / n * 100, 1),
+    rox_8h_pct    = round(sum(is.na(rox_4_8h))  / n * 100, 1),
+    rox_12h_pct   = round(sum(is.na(rox_8_12h)) / n * 100, 1),
+    .groups = "drop"
+  )
+
+cat("\nROX missingness by site (flag sites with >30% missing at any window):\n")
+print(rox_miss_by_site)
+
+problematic_sites <- rox_miss_by_site %>%
+  filter(rox_4h_pct > 30 | rox_8h_pct > 30 | rox_12h_pct > 30)
+if (nrow(problematic_sites) > 0) {
+  warning("Sites with >30% ROX missingness at any window — results may be unreliable for these sites:")
+  print(problematic_sites)
+}
+
+# ── Save diagnostics ──────────────────────────────────────────────────────
+write_csv(rox_miss,            "../output_to_share/rox/diagnostics/01_rox_missingness_overall.csv")
+write_csv(rox_miss_by_outcome, "../output_to_share/rox/diagnostics/01_rox_missingness_by_outcome.csv")
+write_csv(rox_miss_by_site,    "../output_to_share/rox/diagnostics/01_rox_missingness_by_site.csv")
+write_csv(covariate_miss,      "../output_to_share/rox/diagnostics/01_covariate_missingness.csv")
+```
+
+---
+
+# Section 2 — Cohort Description and Table 1
+
+```{r cohort}
+# ── 2.1 Outcome distribution ──────────────────────────────────────────────
+outcome_dist <- df_raw %>%
+  summarise(
+    n_total                    = n(),
+    # 12h outcomes (strict = not allowed NIPPV/CPAP as part of failure; non-strict = does not matter whether you use NIPPV CPAP)
+    n_success_strict_12h       = sum( extubation_success_strict_12h,          na.rm = TRUE),
+    n_failure_strict_12h       = sum(!extubation_success_strict_12h,          na.rm = TRUE),
+    n_success_12h              = sum( extubation_success_12h,                 na.rm = TRUE),
+    n_failure_12h              = sum(!extubation_success_12h,                 na.rm = TRUE),
+    # 24h outcomes (strict = not allowed NIPPV/CPAP as part of failure; non-strict = does not matter whether you use NIPPV CPAP)
+    n_success_strict_24h       = sum( extubation_success_strict_24h,          na.rm = TRUE),
+    n_failure_strict_24h       = sum(!extubation_success_strict_24h,          na.rm = TRUE),
+    n_success_24h              = sum( extubation_success_24h,                 na.rm = TRUE),
+    n_failure_24h              = sum(!extubation_success_24h,                 na.rm = TRUE),
+    # 3-day (strict = not allowed NIPPV/CPAP as part of failure; non-strict = does not matter whether you use NIPPV CPAP)
+    n_success_3d               = sum( extubation_success_3d,        na.rm = TRUE),
+    n_failure_3d               = sum(!extubation_success_3d,        na.rm = TRUE),
+    n_success_strict_3d        = sum( extubation_success_strict_3d, na.rm = TRUE),
+    n_failure_strict_3d        = sum(!extubation_success_strict_3d, na.rm = TRUE),
+    # 7-day (strict = not allowed NIPPV/CPAP as part of failure; non-strict = does not matter whether you use NIPPV CPAP)
+    n_success_7d               = sum( extubation_success_7d,        na.rm = TRUE),
+    n_failure_7d               = sum(!extubation_success_7d,        na.rm = TRUE),
+    n_success_strict_7d        = sum( extubation_success_strict_7d, na.rm = TRUE),
+    n_failure_strict_7d        = sum(!extubation_success_strict_7d, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything()) %>%
+  mutate(
+    pct = round(value / value[name == "n_total"] * 100, 1)
+  )
+
+cat("Outcome distribution:\n")
+print(outcome_dist)
+write_csv(outcome_dist, "../output_to_share/rox/tables/02_outcome_distribution.csv")
+
+# ── 2.2 Prepare analysis dataset ─────────────────────────────────────────
+# Add failure indicators (FALSE = success, TRUE = failure) for convenience
+df <- df_raw %>%
+  mutate(
+    # All outcomes now use same convention (TRUE = success)
+    failure_strict_12h = !extubation_success_strict_12h,
+    failure_12h        = !extubation_success_12h,
+    failure_strict_24h = !extubation_success_strict_24h,
+    failure_24h        = !extubation_success_24h,
+    failure_3d        = !extubation_success_3d,
+    failure_strict_3d = !extubation_success_strict_3d,
+    failure_7d        = !extubation_success_7d,
+    failure_strict_7d = !extubation_success_strict_7d,
+    sex               = factor(sex),
+    chronic_resp_failure_hypoxia = as.integer(chronic_resp_failure_hypoxia)
+  )
+
+# ── 2.3 Table 1 — by 12h extubation outcome ─────────────────────────────
+df %>%
+  select(
+    age, sex, cci, chronic_resp_failure_hypoxia, sofa_extubation,
+    vasopressor_0_4h, rox_0_4h, rox_4_8h, rox_8_12h,
+    extubation_success_strict_12h
+  ) %>%
+  mutate(
+    outcome_group = factor(
+      ifelse(extubation_success_strict_12h, "Success (12h)", "Failure (12h)"),
+      levels = c("Success (12h)", "Failure (12h)")
+    )
+  ) %>%
+  select(-extubation_success_strict_12h) %>%
+  tbl_summary(
+    by = outcome_group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd}) | {median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age                          ~ "Age, years",
+      sex                          ~ "Sex",
+      cci                          ~ "Charlson Comorbidity Index",
+      chronic_resp_failure_hypoxia ~ "Prior Chronic Respiratory Failure with Hypoxia (J96.11)",
+      sofa_extubation              ~ "SOFA Score at Extubation",
+      vasopressor_0_4h             ~ "Vasopressor Use, 0–4h Post-Extubation",
+      rox_0_4h                     ~ "ROX Index at 4h",
+      rox_4_8h                     ~ "ROX Index at 8h",
+      rox_8_12h                    ~ "ROX Index at 12h"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = FALSE) %>%
+  bold_labels() %>%
+  as_tibble() %>%
+  write_csv("../output_to_share/rox/tables/02_table1_by_12h_outcome.csv")
+cat("Table 1 (12h) saved.\n")
+
+# ── 2.4 Table 1 — by 24h extubation outcome ─────────────────────────────
+df %>%
+  select(
+    age, sex, cci, chronic_resp_failure_hypoxia, sofa_extubation,
+    vasopressor_0_4h, rox_0_4h, rox_4_8h, rox_8_12h,
+    extubation_success_strict_24h
+  ) %>%
+  mutate(
+    outcome_group = factor(
+      ifelse(extubation_success_strict_24h, "Success (24h)", "Failure (24h)"),
+      levels = c("Success (24h)", "Failure (24h)")
+    )
+  ) %>%
+  select(-extubation_success_strict_24h) %>%
+  tbl_summary(
+    by = outcome_group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd}) | {median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age                          ~ "Age, years",
+      sex                          ~ "Sex",
+      cci                          ~ "Charlson Comorbidity Index",
+      chronic_resp_failure_hypoxia ~ "Prior Chronic Respiratory Failure with Hypoxia (J96.11)",
+      sofa_extubation              ~ "SOFA Score at Extubation",
+      vasopressor_0_4h             ~ "Vasopressor Use, 0–4h Post-Extubation",
+      rox_0_4h                     ~ "ROX Index at 4h",
+      rox_4_8h                     ~ "ROX Index at 8h",
+      rox_8_12h                    ~ "ROX Index at 12h"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = FALSE) %>%
+  bold_labels() %>%
+  as_tibble() %>%
+  write_csv("../output_to_share/rox/tables/02_table1_by_24h_outcome.csv")
+cat("Table 1 (24h) saved.\n")
+
+# ── 2.5 Table 1 — by 3-day outcome ──────────────────────────────────────
+df %>%
+  select(
+    age, sex, cci, chronic_resp_failure_hypoxia, sofa_extubation,
+    vasopressor_0_4h, rox_0_4h, rox_4_8h, rox_8_12h,
+    extubation_success_3d
+  ) %>%
+  mutate(
+    outcome_group = factor(
+      ifelse(extubation_success_3d, "Success (3d)", "Failure (3d)"),
+      levels = c("Success (3d)", "Failure (3d)")
+    )
+  ) %>%
+  select(-extubation_success_3d) %>%
+  tbl_summary(
+    by = outcome_group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd}) | {median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age                          ~ "Age, years",
+      sex                          ~ "Sex",
+      cci                          ~ "Charlson Comorbidity Index",
+      chronic_resp_failure_hypoxia ~ "Prior Chronic Respiratory Failure with Hypoxia (J96.11)",
+      sofa_extubation              ~ "SOFA Score at Extubation",
+      vasopressor_0_4h             ~ "Vasopressor Use, 0–4h Post-Extubation",
+      rox_0_4h                     ~ "ROX Index at 4h",
+      rox_4_8h                     ~ "ROX Index at 8h",
+      rox_8_12h                    ~ "ROX Index at 12h"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = FALSE) %>%
+  bold_labels() %>%
+  as_tibble() %>% 
+  write_csv("../output_to_share/rox/tables/02_table1_by_3d_outcome.csv")
+cat("Table 1 (3-day) saved.\n")
+
+# ── 2.6 Table 1 — by 7-day outcome ──────────────────────────────────────
+df %>%
+  select(
+    age, sex, cci, chronic_resp_failure_hypoxia, sofa_extubation,
+    vasopressor_0_4h, rox_0_4h, rox_4_8h, rox_8_12h,
+    extubation_success_7d
+  ) %>%
+  mutate(
+    outcome_group = factor(
+      ifelse(extubation_success_7d, "Success (7d)", "Failure (7d)"),
+      levels = c("Success (7d)", "Failure (7d)")
+    )
+  ) %>%
+  select(-extubation_success_7d) %>%
+  tbl_summary(
+    by = outcome_group,
+    statistic = list(
+      all_continuous()  ~ "{mean} ({sd}) | {median} ({p25}, {p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age                          ~ "Age, years",
+      sex                          ~ "Sex",
+      cci                          ~ "Charlson Comorbidity Index",
+      chronic_resp_failure_hypoxia ~ "Prior Chronic Respiratory Failure with Hypoxia (J96.11)",
+      sofa_extubation              ~ "SOFA Score at Extubation",
+      vasopressor_0_4h             ~ "Vasopressor Use, 0–4h Post-Extubation",
+      rox_0_4h                     ~ "ROX Index at 4h",
+      rox_4_8h                     ~ "ROX Index at 8h",
+      rox_8_12h                    ~ "ROX Index at 12h"
+    ),
+    missing = "ifany"
+  ) %>%
+  add_overall(last = FALSE) %>%
+  bold_labels() %>%
+  as_tibble() %>% 
+  write_csv("../output_to_share/rox/tables/02_table1_by_7d_outcome.csv")
+cat("Table 1 (7-day) saved.\n")
+
+# ── 2.7 ROX distribution by outcome — descriptive ─────────────────────────
+rox_by_outcome <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  mutate(window = recode(window,
+    "rox_0_4h" = "4h", "rox_4_8h" = "8h", "rox_8_12h" = "12h")) %>%
+  pivot_longer(
+    cols = c(extubation_success_strict_12h, extubation_success_12h,
+             extubation_success_strict_24h, extubation_success_24h,
+             extubation_success_3d, extubation_success_strict_3d,
+             extubation_success_7d, extubation_success_strict_7d),
+    names_to = "outcome", values_to = "outcome_success"
+  ) %>%
+  mutate(outcome = recode(outcome,
+    "extubation_success_strict_12h" = "12h (Strict)",
+    "extubation_success_12h"        = "12h",
+    "extubation_success_strict_24h" = "24h (Strict)",
+    "extubation_success_24h"        = "24h",
+    "extubation_success_3d"         = "3d",
+    "extubation_success_strict_3d"  = "3d (Strict)",
+    "extubation_success_7d"         = "7d",
+    "extubation_success_strict_7d"  = "7d (Strict)"),
+    outcome = factor(outcome, levels = c(
+      "12h (Strict)", "12h", "24h (Strict)", "24h",
+      "3d", "3d (Strict)", "7d", "7d (Strict)"))
+  ) %>%
+  group_by(outcome, window, outcome_success) %>%
+  summarise(
+    n_rox      = sum(!is.na(rox)),
+    n_miss_rox  = sum(is.na(rox)),
+    median_rox = round(median(rox, na.rm = TRUE), 2),
+    p25_rox    = round(quantile(rox, 0.25, na.rm = TRUE), 2),
+    p75_rox    = round(quantile(rox, 0.75, na.rm = TRUE), 2),
+    mean_rox   = round(mean(rox, na.rm = TRUE), 2),
+    sd_rox     = round(sd(rox, na.rm = TRUE), 2),
+    .groups = "drop"
+  ) %>%
+  arrange(outcome, window, desc(outcome_success)) 
+
+cat("\nROX index by all outcome and window:\n")
+print(rox_by_outcome)
+write_csv(rox_by_outcome, "../output_to_share/rox/tables/02_rox_by_outcome.csv")
+```
+
+---
+
+# Section 3 — Exploratory Visualizations
+
+```{r viz-rox-dist-12h-density, fig.height=7}
+# ── 3.1 ROX density distribution — 12h extubation outcome ──────
+p_rox_dist_12h_std <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(window,
+      "rox_0_4h"  = "4h Post-Extubation",
+      "rox_4_8h"  = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_strict_12h, "Success (12h)", "Failure (12h)"),
+      levels = c("Success (12h)", "Failure (12h)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,      linetype = "dotted", color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,      y = Inf, label = "Roca ≥4.88",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION, y = Inf, label = "Post-ext. ≥8.7",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (12h)" = "#27AE60", "Failure (12h)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (12h)" = "#27AE60", "Failure (12h)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 12h Extubation Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_12h_std_outcome.png",
+       plot = p_rox_dist_12h_std, width = 9, height = 9, dpi = 300)
+p_rox_dist_12h_std
+```
+
+```{r viz-rox-dist-12h-nippv-density, fig.height=7}
+# ── 3.2 ROX density distribution — 12h extubation+NIPPV/CPAP outcome ───
+p_rox_dist_12h_nippv <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(window,
+      "rox_0_4h"  = "4h Post-Extubation",
+      "rox_4_8h"  = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_12h, "Success (12h)", "Failure+NIPPV/CPAP (12h)"),
+      levels = c("Success (12h)", "Failure+NIPPV/CPAP (12h)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,      linetype = "dotted", color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,      y = Inf, label = "Roca ≥4.88",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION, y = Inf, label = "Post-ext. ≥8.7",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (12h)" = "#27AE60", "Failure+NIPPV/CPAP (12h)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (12h)" = "#27AE60", "Failure+NIPPV/CPAP (12h)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 12h Extubation+NIPPV/CPAP Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_12h_nippv_outcome.png",
+       plot = p_rox_dist_12h_nippv, width = 9, height = 9, dpi = 300)
+p_rox_dist_12h_nippv
+```
+
+```{r viz-rox-dist-24h-density, fig.height=7}
+# ── 3.3 ROX density distribution — 24h extubation outcome ──────
+p_rox_dist_24h_std <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(window,
+      "rox_0_4h"  = "4h Post-Extubation",
+      "rox_4_8h"  = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_strict_24h, "Success (24h)", "Failure (24h)"),
+      levels = c("Success (24h)", "Failure (24h)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,      linetype = "dotted", color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,      y = Inf, label = "Roca ≥4.88",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION, y = Inf, label = "Post-ext. ≥8.7",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (24h)" = "#27AE60", "Failure (24h)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (24h)" = "#27AE60", "Failure (24h)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 24h Extubation Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_24h_std_outcome.png",
+       plot = p_rox_dist_24h_std, width = 9, height = 9, dpi = 300)
+p_rox_dist_24h_std
+```
+
+```{r viz-rox-dist-24h-nippv-density, fig.height=7}
+# ── 3.4 ROX density distribution — 24h extubation+NIPPV/CPAP outcome ───
+p_rox_dist_24h_nippv <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(window,
+      "rox_0_4h"  = "4h Post-Extubation",
+      "rox_4_8h"  = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_24h, "Success (24h)", "Failure+NIPPV/CPAP (24h)"),
+      levels = c("Success (24h)", "Failure+NIPPV/CPAP (24h)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,      linetype = "dotted", color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,      y = Inf, label = "Roca ≥4.88",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION, y = Inf, label = "Post-ext. ≥8.7",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (24h)" = "#27AE60", "Failure+NIPPV/CPAP (24h)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (24h)" = "#27AE60", "Failure+NIPPV/CPAP (24h)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 24h Extubation+NIPPV/CPAP Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_24h_nippv_outcome.png",
+       plot = p_rox_dist_24h_nippv, width = 9, height = 9, dpi = 300)
+p_rox_dist_24h_nippv
+```
+
+```{r viz-rox-dist-3d, fig.height=7}
+# ── 3.5 ROX density distribution — 3-day outcome ─────────────────────────
+p_rox_dist_3d <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(window,
+      "rox_0_4h"  = "4h Post-Extubation",
+      "rox_4_8h"  = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_3d, "Success (3d)", "Failure (3d)"),
+      levels = c("Success (3d)", "Failure (3d)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,      linetype = "dotted", color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION, linetype = "dashed", color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,      y = Inf, label = "Roca ≥4.88",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION, y = Inf, label = "Post-ext. ≥8.7",
+           vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (3d)" = "#27AE60", "Failure (3d)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (3d)" = "#27AE60", "Failure (3d)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 3-Day Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_3d_outcome.png",
+       plot = p_rox_dist_3d, width = 9, height = 9, dpi = 300)
+p_rox_dist_3d
+```
+
+```{r viz-rox-distributions, fig.height=7}
+# ── 3.6 ROX density distribution — 7-day outcome ─────────────────────────
+p_rox_dist <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "window", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window        = factor(recode(window,
+      "rox_0_4h" = "4h Post-Extubation",
+      "rox_4_8h" = "8h Post-Extubation",
+      "rox_8_12h" = "12h Post-Extubation"),
+      levels = c("4h Post-Extubation", "8h Post-Extubation", "12h Post-Extubation")),
+    outcome_label = factor(
+      ifelse(extubation_success_7d, "Success (7d)", "Failure (7d)"),
+      levels = c("Success (7d)", "Failure (7d)")
+    )
+  ) %>%
+  ggplot(aes(x = rox, fill = outcome_label, color = outcome_label)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  geom_vline(xintercept = ROX_ROCA_2016,       linetype = "dotted",  color = "grey30", linewidth = 0.7) +
+  geom_vline(xintercept = ROX_POST_EXTUBATION,  linetype = "dashed",  color = "grey30", linewidth = 0.7) +
+  annotate("text", x = ROX_ROCA_2016,       y = Inf, label = "Roca ≥4.88",      vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  annotate("text", x = ROX_POST_EXTUBATION,  y = Inf, label = "Post-ext. ≥8.7", vjust = 1.5, hjust = -0.1, size = 3, color = "grey30") +
+  scale_fill_manual(values  = c("Success (7d)" = "#27AE60", "Failure (7d)" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success (7d)" = "#27AE60", "Failure (7d)" = "#C0392B"), name = NULL) +
+  facet_wrap(~window, ncol = 1) +
+  labs(title    = "ROX Index Distribution by 7-Day Outcome",
+       subtitle = "Dotted = Roca 2016 threshold (4.88); Dashed = post-extubation threshold (8.70)",
+       x = "ROX Index", y = "Density") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"), panel.grid.minor = element_blank(),
+        legend.position = "bottom")
+
+ggsave("../output_to_share/rox/figures/03_rox_distribution_by_outcome.png",
+       plot = p_rox_dist, width = 9, height = 9, dpi = 300)
+p_rox_dist
+```
+
+```{r viz-rox-boxplots-12h, fig.height=9}
+# ── 3.7 ROX boxplot — 12h outcomes ─────────────────────────
+df_box_12h <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h"))
+  ) %>%
+  pivot_longer(
+    cols      = c(extubation_success_strict_12h, extubation_success_12h),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    horizon       = recode(horizon,
+      "extubation_success_strict_12h"          = "Extubation Failure 12h",
+      "extubation_success_12h"                 = "Extubation Failure+NIPPV/CPAP 12h"),
+    horizon       = factor(horizon, levels = c("Extubation Failure 12h",
+                                                "Extubation Failure+NIPPV/CPAP 12h")),
+    outcome_label = factor(
+      ifelse(success, "Success", "Failure"),
+      levels = c("Success", "Failure")
+    )
+  )
+
+p_rox_box_12h <- ggplot(df_box_12h,
+                        aes(x = window, y = rox,
+                            fill = outcome_label, color = outcome_label)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5,
+               position = position_dodge(0.7)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7),
+              size = 0.6, alpha = 0.3) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "ROX Index at Each Post-Extubation Window — 12h Extubation Outcomes",
+       subtitle = "Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_boxplot_12h_outcomes.png",
+       plot = p_rox_box_12h, width = 9, height = 10, dpi = 300)
+p_rox_box_12h
+```
+
+```{r viz-rox-boxplots-24h, fig.height=9}
+# ── 3.8 ROX boxplot — 24h outcomes ─────────────────────────
+df_box_24h <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h"))
+  ) %>%
+  pivot_longer(
+    cols      = c(extubation_success_strict_24h, extubation_success_24h),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    horizon       = recode(horizon,
+      "extubation_success_strict_24h"          = "Extubation Failure 24h",
+      "extubation_success_24h"                 = "Extubation Failure+NIPPV/CPAP 24h"),
+    horizon       = factor(horizon, levels = c("Extubation Failure 24h",
+                                                "Extubation Failure+NIPPV/CPAP 24h")),
+    outcome_label = factor(
+      ifelse(success, "Success", "Failure"),
+      levels = c("Success", "Failure")
+    )
+  )
+
+p_rox_box_24h <- ggplot(df_box_24h,
+                        aes(x = window, y = rox,
+                            fill = outcome_label, color = outcome_label)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5,
+               position = position_dodge(0.7)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7),
+              size = 0.6, alpha = 0.3) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "ROX Index at Each Post-Extubation Window — 24h Extubation Outcomes",
+       subtitle = "Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_boxplot_24h_outcomes.png",
+       plot = p_rox_box_24h, width = 9, height = 10, dpi = 300)
+p_rox_box_24h
+```
+```{r viz-rox-boxplots, fig.height=9}
+# ── 3.9 ROX boxplot — 3d outcomes ─────────────────────────
+df_box_3d <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h"))
+  ) %>%
+  pivot_longer(
+    cols      = c(extubation_success_3d, extubation_success_strict_3d),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    horizon       = recode(horizon,
+      "extubation_success_3d"         = "Extubation Failure 3d",
+      "extubation_success_strict_3d"  = "Extubation Failure+NIPPV/CPAP 3d"),
+    horizon       = factor(horizon, levels = c("Extubation Failure 3d",
+                                                "Extubation Failure+NIPPV/CPAP 3d")),
+    outcome_label = factor(
+      ifelse(success, "Success", "Failure"),
+      levels = c("Success", "Failure")
+    )
+  )
+
+p_rox_box_3d <- ggplot(df_box_3d,
+                        aes(x = window, y = rox,
+                            fill = outcome_label, color = outcome_label)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5,
+               position = position_dodge(0.7)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7),
+              size = 0.6, alpha = 0.3) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "ROX Index at Each Post-Extubation Window — 3d Extubation Outcomes",
+       subtitle = "Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_boxplot_3d_outcomes.png",
+       plot = p_rox_box_3d, width = 9, height = 10, dpi = 300)
+p_rox_box_3d
+
+```
+```{r viz-rox-boxplots, fig.height=9}
+# ── 3.10 ROX boxplot — 7d outcomes ─────────────────────────
+df_box_7d <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  mutate(
+    window = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h"))
+  ) %>%
+  pivot_longer(
+    cols      = c(extubation_success_7d, extubation_success_strict_7d),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    horizon       = recode(horizon,
+      "extubation_success_7d"         = "Extubation Failure 7d",
+      "extubation_success_strict_7d"  = "Extubation Failure+NIPPV/CPAP 7d"),
+    horizon       = factor(horizon, levels = c("Extubation Failure 7d",
+                                                "Extubation Failure+NIPPV/CPAP 7d")),
+    outcome_label = factor(
+      ifelse(success, "Success", "Failure"),
+      levels = c("Success", "Failure")
+    )
+  )
+
+p_rox_box_7d <- ggplot(df_box_7d,
+                        aes(x = window, y = rox,
+                            fill = outcome_label, color = outcome_label)) +
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5,
+               position = position_dodge(0.7)) +
+  geom_jitter(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.7),
+              size = 0.6, alpha = 0.3) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "ROX Index at Each Post-Extubation Window — 7d Extubation Outcomes",
+       subtitle = "Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_boxplot_7d_outcomes.png",
+       plot = p_rox_box_7d, width = 9, height = 10, dpi = 300)
+p_rox_box_7d
+```
+
+```{r viz-rox-trajectory-12h, fig.height=7}
+# ── 3.10 Median ROX trajectory across windows — 12h outcomes ────────────
+df_traj_12h <- bind_rows(
+  df %>%
+    pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+                 names_to = "rox_col", values_to = "rox") %>%
+    filter(!is.na(rox)) %>%
+    mutate(
+      horizon       = "Extubation Failure 12h",
+      outcome_label = factor(ifelse(extubation_success_strict_12h, "Success", "Failure"),
+                             levels = c("Success", "Failure"))
+    ),
+  df %>%
+    pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+                 names_to = "rox_col", values_to = "rox") %>%
+    filter(!is.na(rox)) %>%
+    mutate(
+      horizon       = "Extubation Failure+NIPPV/CPAP 12h",
+      outcome_label = factor(ifelse(extubation_success_12h, "Success", "Failure"),
+                             levels = c("Success", "Failure"))
+    )
+) %>%
+  mutate(
+    window  = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h")),
+    horizon = factor(horizon, levels = c("Extubation Failure 12h",
+                                          "Extubation Failure+NIPPV/CPAP 12h"))
+  ) %>%
+  group_by(horizon, window, outcome_label) %>%
+  summarise(
+    n      = sum(!is.na(rox)),
+    median = median(rox, na.rm = TRUE),
+    p25    = quantile(rox, 0.25, na.rm = TRUE),
+    p75    = quantile(rox, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_rox_traj_12h <- ggplot(df_traj_12h,
+                     aes(x = window, y = median, group = outcome_label,
+                         color = outcome_label, fill = outcome_label)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(aes(size = n), alpha = 0.85) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_size_continuous(name = "N", range = c(2, 6)) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "Median ROX Index Over Post-Extubation Windows — 12h Extubation Outcomes",
+       subtitle = "Median ± IQR ribbon | Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index (Median)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_trajectory_12h_outcome.png",
+       plot = p_rox_traj_12h, width = 9, height = 10, dpi = 300)
+write_csv(df_traj_12h, "../output_to_share/rox/tables/03_rox_trajectory_12h_data.csv")
+
+p_rox_traj_12h
+```
+
+```{r viz-rox-trajectory-24h, fig.height=7}
+# ── 3.11 Median ROX trajectory across windows — 24h outcomes ────────────
+df_traj_24h <- bind_rows(
+  df %>%
+    pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+                 names_to = "rox_col", values_to = "rox") %>%
+    filter(!is.na(rox)) %>%
+    mutate(
+      horizon       = "Extubation Failure 24h",
+      outcome_label = factor(ifelse(extubation_success_strict_24h, "Success", "Failure"),
+                             levels = c("Success", "Failure"))
+    ),
+  df %>%
+    pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+                 names_to = "rox_col", values_to = "rox") %>%
+    filter(!is.na(rox)) %>%
+    mutate(
+      horizon       = "Extubation Failure+NIPPV/CPAP 24h",
+      outcome_label = factor(ifelse(extubation_success_24h, "Success", "Failure"),
+                             levels = c("Success", "Failure"))
+    )
+) %>%
+  mutate(
+    window  = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h")),
+    horizon = factor(horizon, levels = c("Extubation Failure 24h",
+                                          "Extubation Failure+NIPPV/CPAP 24h"))
+  ) %>%
+  group_by(horizon, window, outcome_label) %>%
+  summarise(
+    n      = sum(!is.na(rox)),
+    median = median(rox, na.rm = TRUE),
+    p25    = quantile(rox, 0.25, na.rm = TRUE),
+    p75    = quantile(rox, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_rox_traj_24h <- ggplot(df_traj_24h,
+                     aes(x = window, y = median, group = outcome_label,
+                         color = outcome_label, fill = outcome_label)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(aes(size = n), alpha = 0.85) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_size_continuous(name = "N", range = c(2, 6)) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "Median ROX Index Over Post-Extubation Windows — 24h Extubation Outcomes",
+       subtitle = "Median ± IQR ribbon | Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index (Median)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_trajectory_24h_outcome.png",
+       plot = p_rox_traj_24h, width = 9, height = 10, dpi = 300)
+write_csv(df_traj_24h, "../output_to_share/rox/tables/03_rox_trajectory_24h_data.csv")
+
+p_rox_traj_24h
+```
+
+```{r viz-rox-trajectory-3d, fig.height=7}
+# ── 3.12a Median ROX trajectory across windows — 3-day ───────────────────
+df_traj_3d <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  pivot_longer(
+    cols      = c(extubation_success_3d, extubation_success_strict_3d),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    window  = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h")),
+    horizon = recode(horizon,
+      "extubation_success_3d"        = "Extubation Failure 3d",
+      "extubation_success_strict_3d" = "Extubation Failure+NIPPV/CPAP 3d"),
+    horizon = factor(horizon, levels = c("Extubation Failure 3d",
+                                          "Extubation Failure+NIPPV/CPAP 3d")),
+    outcome_label = factor(ifelse(success, "Success", "Failure"),
+                           levels = c("Success", "Failure"))
+  ) %>%
+  group_by(horizon, window, outcome_label) %>%
+  summarise(
+    n      = sum(!is.na(rox)),
+    median = median(rox, na.rm = TRUE),
+    p25    = quantile(rox, 0.25, na.rm = TRUE),
+    p75    = quantile(rox, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_rox_traj_3d <- ggplot(df_traj_3d,
+                     aes(x = window, y = median, group = outcome_label,
+                         color = outcome_label, fill = outcome_label)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(aes(size = n), alpha = 0.85) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_size_continuous(name = "N", range = c(2, 6)) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "Median ROX Index Over Post-Extubation Windows — 3d Extubation Outcomes",
+       subtitle = "Median ± IQR ribbon | Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index (Median)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_trajectory_3d_outcome.png",
+       plot = p_rox_traj_3d, width = 9, height = 10, dpi = 300)
+write_csv(df_traj_3d, "../output_to_share/rox/tables/03_rox_trajectory_3d_data.csv")
+p_rox_traj_3d
+```
+```{r viz-rox-trajectory-7d, fig.height=7}
+# ── 3.12b Median ROX trajectory across windows — 7-day ───────────────────
+df_traj_7d <- df %>%
+  pivot_longer(cols = c(rox_0_4h, rox_4_8h, rox_8_12h),
+               names_to = "rox_col", values_to = "rox") %>%
+  filter(!is.na(rox)) %>%
+  pivot_longer(
+    cols      = c(extubation_success_7d, extubation_success_strict_7d),
+    names_to  = "horizon",
+    values_to = "success"
+  ) %>%
+  mutate(
+    window  = factor(recode(rox_col,
+      "rox_0_4h"  = "4h",
+      "rox_4_8h"  = "8h",
+      "rox_8_12h" = "12h"),
+      levels = c("4h", "8h", "12h")),
+    horizon = recode(horizon,
+      "extubation_success_7d"        = "Extubation Failure 7d",
+      "extubation_success_strict_7d" = "Extubation Failure+NIPPV/CPAP 7d"),
+    horizon = factor(horizon, levels = c("Extubation Failure 7d",
+                                          "Extubation Failure+NIPPV/CPAP 7d")),
+    outcome_label = factor(ifelse(success, "Success", "Failure"),
+                           levels = c("Success", "Failure"))
+  ) %>%
+  group_by(horizon, window, outcome_label) %>%
+  summarise(
+    n      = sum(!is.na(rox)),
+    median = median(rox, na.rm = TRUE),
+    p25    = quantile(rox, 0.25, na.rm = TRUE),
+    p75    = quantile(rox, 0.75, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_rox_traj_7d <- ggplot(df_traj_7d,
+                     aes(x = window, y = median, group = outcome_label,
+                         color = outcome_label, fill = outcome_label)) +
+  geom_ribbon(aes(ymin = p25, ymax = p75), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1.1) +
+  geom_point(aes(size = n), alpha = 0.85) +
+  geom_hline(yintercept = ROX_POST_EXTUBATION, linetype = "dashed",
+             color = "grey40", linewidth = 0.7) +
+  scale_color_manual(values = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_fill_manual(values  = c("Success" = "#27AE60", "Failure" = "#C0392B"), name = NULL) +
+  scale_size_continuous(name = "N", range = c(2, 6)) +
+  facet_wrap(~horizon, ncol = 1) +
+  labs(title    = "Median ROX Index Over Post-Extubation Windows — 7d Extubation Outcomes",
+       subtitle = "Median ± IQR ribbon | Dashed line = post-extubation threshold (8.70)",
+       x = "Time Post-Extubation", y = "ROX Index (Median)") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title       = element_text(face = "bold"),
+        panel.grid.minor = element_blank(),
+        legend.position  = "bottom",
+        strip.text       = element_text(face = "bold", size = 12))
+
+ggsave("../output_to_share/rox/figures/03_rox_trajectory_7d_outcome.png",
+       plot = p_rox_traj_7d, width = 9, height = 10, dpi = 300)
+write_csv(df_traj_7d, "../output_to_share/rox/tables/03_rox_trajectory_7d_data.csv")
+p_rox_traj_7d
+```
+
+
+```{r viz-rox-covariate, fig.height=8}
+# ── 3.14 Baseline covariate distributions by 3-day and 7-day outcome ───────
+# Mirrors the HFNO file's Section 3.4 baseline characteristics panel
+
+make_covariate_panel <- function(outcome_col, outcome_label_success,
+                                  outcome_label_failure, colors, title_suffix) {
+  df %>%
+    mutate(
+      outcome_group = factor(
+        ifelse(.data[[outcome_col]], outcome_label_success, outcome_label_failure),
+        levels = c(outcome_label_success, outcome_label_failure)
+      )
+    ) %>%
+    select(outcome_group, age, sofa_extubation, cci,
+           rox_0_4h, rox_4_8h, rox_8_12h,
+           vasopressor_0_4h, chronic_resp_failure_hypoxia) %>%
+    mutate(
+      vasopressor_0_4h             = as.numeric(vasopressor_0_4h),
+      chronic_resp_failure_hypoxia = as.numeric(chronic_resp_failure_hypoxia)
+    ) %>%
+    pivot_longer(cols = -outcome_group, names_to = "variable", values_to = "value") %>%
+    mutate(var_label = recode(variable,
+      "age"                          = "Age (years)",
+      "sofa_extubation"              = "SOFA at Extubation",
+      "cci"                          = "Charlson Index",
+      "rox_0_4h"                     = "ROX at 4h",
+      "rox_4_8h"                     = "ROX at 8h",
+      "rox_8_12h"                    = "ROX at 12h",
+      "vasopressor_0_4h"             = "Vasopressors (0–4h)",
+      "chronic_resp_failure_hypoxia" = "Prior Chronic Resp. Failure"
+    )) %>%
+    filter(!is.na(value)) %>%
+    ggplot(aes(x = outcome_group, y = value,
+               fill = outcome_group, color = outcome_group)) +
+    geom_boxplot(alpha = 0.4, outlier.shape = NA, width = 0.5) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.4) +
+    scale_fill_manual(values  = colors, guide = "none") +
+    scale_color_manual(values = colors, guide = "none") +
+    facet_wrap(~var_label, scales = "free_y", ncol = 4) +
+    labs(title = paste("Baseline Characteristics by", title_suffix),
+         x = NULL, y = NULL) +
+    theme_minimal(base_size = 11) +
+    theme(plot.title  = element_text(face = "bold"),
+          strip.text  = element_text(face = "bold"),
+          axis.text.x = element_text(angle = 20, hjust = 1),
+          panel.grid.minor = element_blank())
+}
+
+p_cov_12h_strict <- make_covariate_panel(
+  outcome_col            = "extubation_success_strict_12h",
+  outcome_label_success  = "Success (12h)",
+  outcome_label_failure  = "Failure (12h)",
+  colors                 = c("Success (12h)" = "#27AE60", "Failure (12h)" = "#C0392B"),
+  title_suffix           = "12h Extubation Failure")
+
+p_cov_12h <- make_covariate_panel(
+  outcome_col            = "extubation_success_12h",
+  outcome_label_success  = "Success (12h)",
+  outcome_label_failure  = "Failure+NIPPV/CPAP (12h)",
+  colors                 = c("Success (12h)" = "#27AE60", "Failure+NIPPV/CPAP (12h)" = "#C0392B"),
+  title_suffix           = "12h Extubation Failure+NIPPV/CPAP")
+
+p_cov_24h_strict <- make_covariate_panel(
+  outcome_col            = "extubation_success_strict_24h",
+  outcome_label_success  = "Success (24h)",
+  outcome_label_failure  = "Failure (24h)",
+  colors                 = c("Success (24h)" = "#27AE60", "Failure (24h)" = "#C0392B"),
+  title_suffix           = "24h Extubation Failure")
+
+p_cov_24h <- make_covariate_panel(
+  outcome_col            = "extubation_success_24h",
+  outcome_label_success  = "Success (24h)",
+  outcome_label_failure  = "Failure+NIPPV/CPAP (24h)",
+  colors                 = c("Success (24h)" = "#27AE60", "Failure+NIPPV/CPAP (24h)" = "#C0392B"),
+  title_suffix           = "24h Extubation Failure+NIPPV/CPAP")
+
+p_cov_3d_strict <- make_covariate_panel(
+  outcome_col            = "extubation_success_strict_3d",
+  outcome_label_success  = "Success (3d)",
+  outcome_label_failure  = "Failure+NIPPV/CPAP (3d)",
+  colors                 = c("Success (3d)" = "#27AE60", "Failure+NIPPV/CPAP (3d)" = "#C0392B"),
+  title_suffix           = "3d Extubation Failure+NIPPV/CPAP")
+
+p_cov_3d <- make_covariate_panel(
+  outcome_col            = "extubation_success_3d",
+  outcome_label_success  = "Success (3d)",
+  outcome_label_failure  = "Failure (3d)",
+  colors                 = c("Success (3d)" = "#27AE60", "Failure (3d)" = "#C0392B"),
+  title_suffix           = "3d Extubation Failure")
+
+p_cov_7d_strict <- make_covariate_panel(
+  outcome_col            = "extubation_success_strict_7d",
+  outcome_label_success  = "Success (7d)",
+  outcome_label_failure  = "Failure+NIPPV/CPAP (7d)",
+  colors                 = c("Success (7d)" = "#27AE60", "Failure+NIPPV/CPAP (7d)" = "#C0392B"),
+  title_suffix           = "7d Extubation Failure+NIPPV/CPAP")
+
+p_cov_7d <- make_covariate_panel(
+  outcome_col            = "extubation_success_7d",
+  outcome_label_success  = "Success (7d)",
+  outcome_label_failure  = "Failure (7d)",
+  colors                 = c("Success (7d)" = "#27AE60", "Failure (7d)" = "#C0392B"),
+  title_suffix           = "7d Extubation Failure")
+
+ggsave("../output_to_share/rox/figures/03_covariates_12h_strict_outcome.png",
+       plot = p_cov_12h_strict, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_12h_outcome.png",
+       plot = p_cov_12h, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_24h_strict_outcome.png",
+       plot = p_cov_24h_strict, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_24h_outcome.png",
+       plot = p_cov_24h, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_3d_outcome.png",
+       plot = p_cov_3d, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_3d_strict_outcome.png",
+       plot = p_cov_3d_strict, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_7d_outcome.png",
+       plot = p_cov_7d, width = 13, height = 8, dpi = 300)
+ggsave("../output_to_share/rox/figures/03_covariates_7d_strict_outcome.png",
+       plot = p_cov_7d_strict, width = 13, height = 8, dpi = 300)
+
+p_cov_12h_strict
+p_cov_12h
+p_cov_24h_strict
+p_cov_24h
+p_cov_3d
+p_cov_3d_strict
+p_cov_7d
+p_cov_7d_strict
+```
+
+---
+
+# Section 4 — AUROC Analysis
+
+ROX index (continuous) is evaluated as a predictor of each of the 8 outcomes at each of the 3 timepoints. This yields 24 ROC curves total (8 outcomes × 3 timepoints). DeLong's test compares AUROCs across timepoints within each outcome.
+
+**Note on complete-case analysis:** All ROC and regression analyses use only patients with non-missing ROX values at the relevant window. Missingness counts are reported in Section 1. If a site has substantial or differential missingness, interpret results with caution and flag for the coordinating site.
+
+```{r auroc}
+# ── 4.1 Compute AUROCs for all outcome × timepoint combinations ───────────
+
+# Failure indicators (chronological order: 12h, 24h, 3d, 7d)
+failure_vars <- c(
+  "Extubation Failure 12h"            = "failure_12h",
+  "Extubation Failure+NIPPV/CPAP 12h" = "failure_strict_12h",
+  "Extubation Failure 24h"            = "failure_24h",
+  "Extubation Failure+NIPPV/CPAP 24h" = "failure_strict_24h",
+  "Extubation Failure 3d"             = "failure_3d",
+  "Extubation Failure+NIPPV/CPAP 3d"  = "failure_strict_3d",
+  "Extubation Failure 7d"             = "failure_7d",
+  "Extubation Failure+NIPPV/CPAP 7d"  = "failure_strict_7d"
+)
+
+rox_col_labels <- c(
+  "rox_0_4h"  = "4h",
+  "rox_4_8h"  = "8h",
+  "rox_8_12h" = "12h"
+)
+
+# Store ROC objects for later plotting and DeLong comparison
+roc_objects <- list()
+
+auroc_results <- map_dfr(names(failure_vars), function(out_label) {
+  fv <- failure_vars[[out_label]]
+  map_dfr(names(rox_col_labels), function(rox_col) {
+    tp_label <- rox_col_labels[[rox_col]]
+    dat      <- df %>% filter(!is.na(.data[[rox_col]]))
+    n_total  <- nrow(dat)
+    n_fail   <- sum(dat[[fv]], na.rm = TRUE)
+    n_succ   <- n_total - n_fail
+
+    if (n_fail < 5 | n_succ < 5) {
+      warning("Insufficient events for ROC at ", out_label, " / ", tp_label,
+              " (", n_fail, " failures, ", n_succ, " successes) — skipping.")
+      return(NULL)
+    }
+
+    roc_obj <- roc(dat[[fv]], dat[[rox_col]], direction = "auto",
+                   quiet = TRUE, ci = TRUE)
+
+    roc_objects[[paste0(out_label, "__", tp_label)]] <<- roc_obj
+
+    tibble(
+      outcome       = out_label,
+      timepoint     = tp_label,
+      n_total       = n_total,
+      n_failure     = n_fail,
+      n_success     = n_succ,
+      auc           = round(as.numeric(roc_obj$auc), 3),
+      auc_lower     = round(as.numeric(roc_obj$ci[1]), 3),
+      auc_upper     = round(as.numeric(roc_obj$ci[3]), 3),
+      # ">" = higher ROX associated with more failure (inverse of Roca 2016 expectation)
+      # "<" = higher ROX associated with less failure (expected per published literature)
+      roc_direction = roc_obj$direction
+    )
+  })
+})
+
+# ── Flag unexpected direction ─────────────────────────────────────────────
+unexpected_dir <- auroc_results %>% filter(roc_direction == ">")
+if (nrow(unexpected_dir) > 0) {
+  message("NOTE: ", nrow(unexpected_dir), " ROC(s) have direction='>' (higher ROX = more failure). ",
+          "This may reflect FiO2 titration in response to deterioration in operational EHR data. ",
+          "AUCs are reported correctly by pROC. Flag for coordinating site.")
+  print(unexpected_dir %>% select(outcome, timepoint, auc, roc_direction))
+}
+
+kable(auroc_results,
+      caption = "AUROC by Outcome and ROX Timepoint (95% CI via DeLong)",
+      col.names = c("Outcome", "Timepoint", "N Total", "N Failure",
+                    "N Success", "AUROC", "95% CI Lower", "95% CI Upper", "ROC Direction"))
+write_csv(auroc_results, "../output_to_share/rox/models/04_auroc_results.csv")
+```
+
+```{r delong}
+# ── 4.2 DeLong's test — compare timepoints within each outcome ────────────
+delong_results <- map_dfr(names(failure_vars), function(out_label) {
+  pairs <- list(c("4h", "8h"), c("4h", "12h"), c("8h", "12h"))
+  map_dfr(pairs, function(pair) {
+    key1 <- paste0(out_label, "__", pair[1])
+    key2 <- paste0(out_label, "__", pair[2])
+    if (!key1 %in% names(roc_objects) | !key2 %in% names(roc_objects)) return(NULL)
+    tryCatch({
+      test <- roc.test(roc_objects[[key1]], roc_objects[[key2]], method = "delong")
+      tibble(
+        outcome         = out_label,
+        timepoint_1     = pair[1],
+        timepoint_2     = pair[2],
+        auc_1           = round(as.numeric(roc_objects[[key1]]$auc), 3),
+        auc_2           = round(as.numeric(roc_objects[[key2]]$auc), 3),
+        delong_p        = round(test$p.value, 4)
+      )
+    }, error = function(e) {
+      cat("DeLong test failed for", out_label, pair[1], "vs", pair[2], ":", conditionMessage(e), "\n")
+      NULL
+    })
+  })
+})
+
+kable(delong_results,
+      caption = "DeLong's Test — Pairwise Comparison of AUROCs Across Timepoints")
+write_csv(delong_results, "../output_to_share/rox/models/04_delong_tests.csv")
+```
+
+```{r roc-plots, fig.height=16}
+# ── 4.3 ROC curves — 4 panels (one per outcome), 3 lines per panel ─────────
+timepoint_colors <- c("4h" = "#2980B9", "8h" = "#E67E22", "12h" = "#8E44AD")
+
+roc_plot_list <- map(names(failure_vars), function(out_label) {
+  fv <- failure_vars[[out_label]]
+
+  # Build ggplot data from all 3 ROC objects for this outcome
+  roc_df <- map_dfr(names(rox_col_labels), function(rox_col) {
+    tp_label <- rox_col_labels[[rox_col]]
+    key      <- paste0(out_label, "__", tp_label)
+    if (!key %in% names(roc_objects)) return(NULL)
+    roc_obj <- roc_objects[[key]]
+    tibble(
+      specificity = roc_obj$specificities,
+      sensitivity = roc_obj$sensitivities,
+      timepoint   = tp_label,
+      auc_label   = sprintf("%s  AUC=%.3f", tp_label,
+                            as.numeric(roc_obj$auc))
+    )
+  })
+
+  if (nrow(roc_df) == 0) return(NULL)
+
+  ggplot(roc_df, aes(x = 1 - specificity, y = sensitivity,
+                     color = timepoint, linetype = timepoint)) +
+    geom_line(linewidth = 1.0) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey60") +
+    scale_color_manual(
+      values = timepoint_colors,
+      labels = roc_df %>% distinct(timepoint, auc_label) %>% deframe(),
+      name   = NULL
+    ) +
+    scale_linetype_manual(
+      values = c("4h" = "solid", "8h" = "dashed", "12h" = "dotdash"),
+      labels = roc_df %>% distinct(timepoint, auc_label) %>% deframe(),
+      name   = NULL
+    ) +
+    labs(title = out_label,
+         x = "1 – Specificity (FPR)", y = "Sensitivity (TPR)") +
+    theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", size = 11),
+          legend.position = "bottom",
+          panel.grid.minor = element_blank())
+})
+
+# Remove NULLs and combine
+roc_plot_list <- compact(roc_plot_list)
+
+if (length(roc_plot_list) > 0) {
+  p_roc_combined <- wrap_plots(roc_plot_list, ncol = 2) +
+    plot_annotation(
+      title    = "ROC Curves: ROX Index Predicting Post-Extubation Outcomes",
+      subtitle = "Each panel = one outcome definition; lines = ROX timepoint",
+      theme    = theme(plot.title    = element_text(face = "bold", size = 14),
+                       plot.subtitle = element_text(size = 11))
+    )
+
+  ggsave("../output_to_share/rox/figures/04_roc_curves_all_outcomes.png",
+         plot = p_roc_combined, width = 14, height = 20, dpi = 300)
+  p_roc_combined
+} else {
+  cat("No ROC curves could be generated — check event counts.\n")
+}
+```
+
+---
+
+# Section 5 — Optimal Threshold Derivation
+
+Empirical thresholds derived using the Youden index (maximizing sensitivity + specificity – 1) are reported alongside the published Roca 2016 threshold (≥4.88) and post-extubation literature threshold (≥8.70).
+
+```{r thresholds}
+# ── 5.1 Youden-optimal thresholds for all 12 combinations ────────────────
+threshold_results <- map_dfr(names(failure_vars), function(out_label) {
+  fv <- failure_vars[[out_label]]
+  map_dfr(names(rox_col_labels), function(rox_col) {
+    tp_label <- rox_col_labels[[rox_col]]
+    key      <- paste0(out_label, "__", tp_label)
+    if (!key %in% names(roc_objects)) return(NULL)
+
+    roc_obj <- roc_objects[[key]]
+    best    <- coords(roc_obj, "best", best.method = "youden",
+                      ret = c("threshold", "sensitivity", "specificity",
+                              "ppv", "npv", "accuracy"))
+
+    # Also evaluate at published thresholds
+    eval_thresh <- function(thr) {
+      dat    <- df %>% filter(!is.na(.data[[rox_col]]))
+      pred   <- as.integer(dat[[rox_col]] >= thr)
+      actual <- as.integer(dat[[fv]])
+      tp <- sum(pred == 1 & actual == 1)
+      fp <- sum(pred == 1 & actual == 0)
+      tn <- sum(pred == 0 & actual == 0)
+      fn <- sum(pred == 0 & actual == 1)
+      list(
+        sens = round(tp / (tp + fn), 3),
+        spec = round(tn / (tn + fp), 3),
+        ppv  = round(tp / (tp + fp), 3),
+        npv  = round(tn / (tn + fn), 3)
+      )
+    }
+
+    roca_perf    <- eval_thresh(ROX_ROCA_2016)
+    postex_perf  <- eval_thresh(ROX_POST_EXTUBATION)
+
+    tibble(
+      outcome               = out_label,
+      timepoint             = tp_label,
+      # Youden
+      youden_threshold      = round(best$threshold, 2),
+      youden_sensitivity    = round(best$sensitivity, 3),
+      youden_specificity    = round(best$specificity, 3),
+      youden_ppv            = round(best$ppv, 3),
+      youden_npv            = round(best$npv, 3),
+      # Roca 2016
+      roca_threshold        = ROX_ROCA_2016,
+      roca_sensitivity      = roca_perf$sens,
+      roca_specificity      = roca_perf$spec,
+      roca_ppv              = roca_perf$ppv,
+      roca_npv              = roca_perf$npv,
+      # Post-extubation
+      postex_threshold      = ROX_POST_EXTUBATION,
+      postex_sensitivity    = postex_perf$sens,
+      postex_specificity    = postex_perf$spec,
+      postex_ppv            = postex_perf$ppv,
+      postex_npv            = postex_perf$npv
+    )
+  })
+})
+
+# Print in wide format for readability
+kable(
+  threshold_results %>%
+    select(outcome, timepoint,
+           youden_threshold, youden_sensitivity, youden_specificity, youden_ppv, youden_npv),
+  caption = "5.1 Youden-Optimal Thresholds — Sensitivity, Specificity, PPV, NPV"
+)
+
+kable(
+  threshold_results %>%
+    select(outcome, timepoint,
+           roca_sensitivity, roca_specificity, roca_ppv, roca_npv,
+           postex_sensitivity, postex_specificity, postex_ppv, postex_npv),
+  caption = "5.2 Published Threshold Performance (Roca ≥4.88 and Post-Extubation ≥8.70)"
+)
+
+write_csv(threshold_results, "../output_to_share/rox/models/05_threshold_performance.csv")
+```
+
+---
+
+# Section 6 — Adjusted Logistic Regression
+
+For each of the 24 outcome × timepoint combinations, two logistic regression models are fitted:
+
+- **Model A — Continuous ROX:** ROX as a continuous predictor alongside covariates
+- **Model B — Dichotomized ROX:** ROX ≥ empirical Youden threshold (binary) alongside covariates
+
+**Covariates in all models:** age, sex, CCI, chronic respiratory failure with hypoxia, SOFA at extubation, window-matched vasopressor use
+
+**Clustering:** Site fixed effects added if >1 hospital site; cluster-robust standard errors applied in all multi-site runs using the sandwich estimator.
+
+```{r regression-setup}
+# ── 6.0 Detect clustering scenario ───────────────────────────────────────
+n_sites        <- n_distinct(df$hospital_id)
+multi_site     <- n_sites > 1
+use_site_fe    <- multi_site     # site fixed effects if multi-site
+
+cat("Number of sites:", n_sites, "\n")
+cat("Multi-site run:", multi_site, "\n")
+cat("Site fixed effects:", use_site_fe, "\n")
+cat("Cluster-robust SEs:", multi_site, "\n")
+
+if (!multi_site) {
+  cat("Single-site run: standard logistic regression without clustering adjustments.\n")
+}
+```
+
+```{r regression-models}
+# ── Helper: fit logistic model and extract OR with 95% CI ─────────────────
+fit_logistic <- function(outcome_var, rox_col, rox_binary_col,
+                         vasopressor_col, data, use_fe, multi_site) {
+
+  # Base formula covariates
+  base_covars <- "age + sex + cci + chronic_resp_failure_hypoxia + sofa_extubation"
+  vaso_term   <- vasopressor_col
+  fe_term     <- if (use_fe) "+ hospital_id" else ""
+
+  # Model A: continuous ROX
+  fmla_cont <- as.formula(
+    paste0(outcome_var, " ~ ", rox_col, " + ", base_covars,
+           " + ", vaso_term, fe_term)
+  )
+
+  # Model B: dichotomized ROX
+  fmla_bin <- as.formula(
+    paste0(outcome_var, " ~ ", rox_binary_col, " + ", base_covars,
+           " + ", vaso_term, fe_term)
+  )
+
+  fit_and_extract <- function(fmla, model_type) {
+    tryCatch({
+      fit <- glm(fmla, data = data, family = binomial(link = "logit"),
+                 na.action = na.omit)
+
+      # Cluster-robust SEs if multi-site
+      if (multi_site) {
+        vcov_robust <- vcovCL(fit, cluster = ~hospital_id)
+        coef_robust <- coeftest(fit, vcov = vcov_robust)
+        results <- tidy(coef_robust) %>%
+          filter(grepl(rox_col, term) | grepl(rox_binary_col, term)) %>%
+          mutate(
+            or      = round(exp(estimate), 3),
+            or_low  = round(exp(estimate - 1.96 * std.error), 3),
+            or_high = round(exp(estimate + 1.96 * std.error), 3),
+            p_value = round(p.value, 4),
+            se_type = "cluster-robust"
+          )
+      } else {
+        results <- tidy(fit) %>%
+          filter(grepl(rox_col, term) | grepl(rox_binary_col, term)) %>%
+          mutate(
+            or      = round(exp(estimate), 3),
+            or_low  = round(exp(estimate - 1.96 * std.error), 3),
+            or_high = round(exp(estimate + 1.96 * std.error), 3),
+            p_value = round(p.value, 4),
+            se_type = "standard"
+          )
+      }
+
+      results %>%
+        mutate(
+          model_type   = model_type,
+          n_obs        = nobs(fit),
+          n_outcome    = sum(data[[outcome_var]], na.rm = TRUE)
+        ) %>%
+        select(model_type, term, or, or_low, or_high, p_value, se_type, n_obs, n_outcome)
+
+    }, error = function(e) {
+      cat("Model failed:", conditionMessage(e), "\n")
+      NULL
+    })
+  }
+
+  bind_rows(
+    fit_and_extract(fmla_cont, "Continuous ROX"),
+    fit_and_extract(fmla_bin,  "Dichotomized ROX (Youden)")
+  )
+}
+
+# ── 6.1 Prepare binary ROX columns (using Youden threshold per combo) ─────
+# We need the Youden thresholds computed in Section 5
+df_with_binary <- df
+
+for (i in seq_len(nrow(threshold_results))) {
+  rox_col   <- unname(rox_windows[threshold_results$timepoint[i]])
+  youden_t  <- threshold_results$youden_threshold[i]
+  new_col   <- paste0("rox_binary_",
+                      gsub(" ", "_", gsub("[^0-9A-Za-z]", "_", threshold_results$outcome[i])),
+                      "_", threshold_results$timepoint[i])
+  df_with_binary[[new_col]] <- as.integer(df_with_binary[[rox_col]] >= youden_t)
+}
+
+# ── 6.2 Run all 24 × 2 models ─────────────────────────────────────────────
+regression_results <- map_dfr(names(failure_vars), function(out_label) {
+  fv    <- failure_vars[[out_label]]
+  map_dfr(names(rox_col_labels), function(rox_col) {
+    tp_label    <- rox_col_labels[[rox_col]]
+    vaso_col    <- vaso_for_window[[tp_label]]
+    binary_col  <- paste0("rox_binary_",
+                          gsub(" ", "_", gsub("[^0-9A-Za-z]", "_", out_label)),
+                          "_", tp_label)
+
+    dat <- df_with_binary %>% filter(!is.na(.data[[rox_col]]))
+
+    result <- fit_logistic(
+      outcome_var    = fv,
+      rox_col        = rox_col,
+      rox_binary_col = binary_col,
+      vasopressor_col = vaso_col,
+      data           = dat,
+      use_fe         = use_site_fe,
+      multi_site     = multi_site
+    )
+
+    if (!is.null(result)) {
+      result %>% mutate(outcome = out_label, timepoint = tp_label, .before = 1)
+    }
+  })
+})
+
+kable(regression_results,
+      caption = "Logistic Regression — OR for ROX Index on Post-Extubation Outcomes (Continuous and Dichotomized)",
+      col.names = c("Outcome", "Timepoint", "Model", "Term", "OR", "OR 95% CI Low",
+                    "OR 95% CI High", "p-value", "SE Type", "N Obs", "N Outcome"))
+
+write_csv(regression_results, "../output_to_share/rox/models/06_regression_results.csv")
+```
+
+
+
+
+---
+
+# Section 8 — Site-Stratified AUROC Summary
+
+For federated synthesis, AUROCs are computed separately per site to allow the coordinating site to assess between-site heterogeneity.
+
+```{r site-auroc}
+if (multi_site) {
+
+  site_auroc_results <- map_dfr(unique(df$hospital_id), function(site) {
+    df_site <- df %>% filter(hospital_id == site)
+    map_dfr(names(failure_vars), function(out_label) {
+      fv <- failure_vars[[out_label]]
+      map_dfr(names(rox_col_labels), function(rox_col) {
+        tp_label <- rox_col_labels[[rox_col]]
+        dat      <- df_site %>% filter(!is.na(.data[[rox_col]]))
+        n_fail   <- sum(dat[[fv]], na.rm = TRUE)
+        n_succ   <- nrow(dat) - n_fail
+
+        if (n_fail < 5 | n_succ < 5) {
+          return(tibble(hospital_id = site, outcome = out_label, timepoint = tp_label,
+                        n = nrow(dat), n_failure = n_fail, auc = NA_real_,
+                        note = "Insufficient events"))
+        }
+
+        tryCatch({
+          roc_site <- roc(dat[[fv]], dat[[rox_col]], direction = "auto", quiet = TRUE, ci = TRUE)
+          tibble(
+            hospital_id = site,
+            outcome     = out_label,
+            timepoint   = tp_label,
+            n           = nrow(dat),
+            n_failure   = n_fail,
+            auc         = round(as.numeric(roc_site$auc), 3),
+            auc_lower   = round(as.numeric(roc_site$ci[1]), 3),
+            auc_upper   = round(as.numeric(roc_site$ci[3]), 3),
+            note        = "OK"
+          )
+        }, error = function(e) {
+          tibble(hospital_id = site, outcome = out_label, timepoint = tp_label,
+                 n = nrow(dat), n_failure = n_fail, auc = NA_real_,
+                 note = conditionMessage(e))
+        })
+      })
+    })
+  })
+
+  kable(site_auroc_results,
+        caption = "Site-Stratified AUROCs — Return to Coordinating Site for Pooled Analysis")
+  write_csv(site_auroc_results, "../output_to_share/rox/models/08_site_stratified_auroc.csv")
+
+} else {
+  cat("Single-site run — site-stratified AUROC not applicable.\n")
+  write_csv(tibble(note = "Single-site run — site-stratified AUROC not generated"),
+            "../output_to_share/rox/models/08_site_stratified_auroc.csv")
+}
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+writeLines(capture.output(sessionInfo()), "../output_to_share/rox/session_info.txt")
+sessionInfo()
+```
+
+---
+
+# Output File Summary
+
+The following files are saved to `output_to_share/rox/` for return to the coordinating site. **Return all files.**
+
+**Diagnostics:**
+
+- `diagnostics/01_rox_missingness_overall.csv` — overall ROX missingness by window ⭐
+- `diagnostics/01_rox_missingness_by_outcome.csv` — differential missingness check ⭐
+- `diagnostics/01_rox_missingness_by_site.csv` — per-site missingness ⭐
+- `diagnostics/01_covariate_missingness.csv`
+
+**Tables:**
+
+- `tables/02_outcome_distribution.csv` — cohort outcome counts (all 8 outcomes)
+- `tables/02_table1_by_7d_outcome.csv` — Table 1 by 7-day outcome ⭐
+- `tables/02_table1_by_3d_outcome.csv` — Table 1 by 3-day outcome
+- `tables/02_table1_by_12h_outcome.csv` — Table 1 by 12h extubation outcome ⭐
+- `tables/02_table1_by_24h_outcome.csv` — Table 1 by 24h extubation outcome ⭐
+- `tables/02_rox_by_outcome.csv` — ROX descriptives by outcome and window
+- `tables/03_rox_trajectory_data.csv` — trajectory data (3d/7d) for coordinating site
+- `tables/03_rox_trajectory_12h_data.csv` — trajectory data (12h outcomes) for coordinating site
+- `tables/03_rox_trajectory_24h_data.csv` — trajectory data (24h outcomes) for coordinating site
+- `tables/03_rox_trajectory_composite_data.csv` — trajectory data (12h/24h composites) for coordinating site
+
+**Models:**
+
+- `models/04_auroc_results.csv` — AUROCs (all 24 combinations: 8 outcomes × 3 timepoints) ⭐
+- `models/04_delong_tests.csv` — pairwise DeLong tests ⭐
+- `models/05_threshold_performance.csv` — Youden + published threshold performance ⭐
+- `models/06_regression_results.csv` — OR for ROX (continuous + dichotomized, all 8 outcomes) ⭐
+- `models/07_logrank_results.csv` — log-rank test results
+- `models/08_site_stratified_auroc.csv` — per-site AUROCs (all 8 outcomes) ⭐
+
+**Figures** (return if flagged or if requested by coordinating site):
+
+- `figures/03_rox_distribution_by_outcome.png` — density, 7-day outcome
+- `figures/03_rox_distribution_3d_outcome.png` — density, 3-day outcome
+- `figures/03_rox_distribution_24h_std_outcome.png` — density, 24h extubation outcome ⭐
+- `figures/03_rox_distribution_24h_nippv_outcome.png` — density, 24h extubation+NIPPV/CPAP outcome ⭐
+- `figures/03_rox_distribution_12h_std_outcome.png` — density, 12h extubation outcome ⭐
+- `figures/03_rox_distribution_12h_nippv_outcome.png` — density, 12h extubation+NIPPV/CPAP outcome ⭐
+- `figures/03_rox_boxplot_both_outcomes.png` — boxplots, 3-day and 7-day faceted ⭐
+- `figures/03_rox_boxplot_12h_outcomes.png` — boxplots, 12h outcomes (standard and +NIPPV/CPAP) ⭐
+- `figures/03_rox_boxplot_24h_outcomes.png` — boxplots, 24h outcomes (standard and +NIPPV/CPAP) ⭐
+- `figures/03_rox_boxplot_composite_outcomes.png` — boxplots, 12h and 24h extubation outcomes ⭐
+- `figures/03_rox_boxplot_composite_nippv_outcomes.png` — boxplots, 12h and 24h extubation+NIPPV/CPAP outcomes ⭐
+- `figures/03_rox_trajectory_by_outcome.png` — median ROX over windows, 3d/7d horizons ⭐
+- `figures/03_rox_trajectory_12h_outcome.png` — median ROX over windows, 12h outcomes ⭐
+- `figures/03_rox_trajectory_24h_outcome.png` — median ROX over windows, 24h outcomes ⭐
+- `figures/03_rox_trajectory_composite_outcome.png` — median ROX over windows, 12h/24h composites ⭐
+- `figures/03_covariates_7d_outcome.png` — baseline characteristics panel, 7-day
+- `figures/03_covariates_3d_outcome.png` — baseline characteristics panel, 3-day
+- `figures/03_covariates_12h_outcome.png` — baseline characteristics panel, 12h extubation outcome
+- `figures/03_covariates_12h_nippv_outcome.png` — baseline characteristics panel, 12h extubation+NIPPV/CPAP outcome
+- `figures/03_covariates_24h_outcome.png` — baseline characteristics panel, 24h extubation outcome
+- `figures/03_covariates_24h_nippv_outcome.png` — baseline characteristics panel, 24h extubation+NIPPV/CPAP outcome
+- `figures/04_roc_curves_all_outcomes.png` — ROC curves for all 8 outcomes ⭐
+- `figures/06_forest_continuous_rox.png` ⭐
+- `figures/07_km_7d_standard.png` ⭐
+- `figures/07_km_3d_standard.png`
+
+⭐ = Priority files for coordinating site synthesis

@@ -1394,12 +1394,42 @@ def _(cohort, events, pl):
 
     # Define time windows
     outcome_base = outcome_base.with_columns([
+        (pl.col("extubation_time") + pl.duration(hours=12)).alias("cutoff_12h"),
+        (pl.col("extubation_time") + pl.duration(hours=24)).alias("cutoff_24h"),
         (pl.col("extubation_time") + pl.duration(hours=72)).alias("cutoff_3d"),
         (pl.col("extubation_time") + pl.duration(hours=168)).alias("cutoff_7d"),
     ])
 
     # Event flags within each window
     outcome_base = outcome_base.with_columns([
+        # 12-hour flags
+        (
+            pl.col("reintubation_time").is_not_null()
+            & (pl.col("reintubation_time") <= pl.col("cutoff_12h"))
+        ).alias("reintubation_in_12h"),
+        (
+            pl.col("death_time").is_not_null()
+            & (pl.col("death_time") > pl.col("extubation_time"))
+            & (pl.col("death_time") <= pl.col("cutoff_12h"))
+        ).alias("death_in_12h"),
+        (
+            pl.col("nippv_cpap_time").is_not_null()
+            & (pl.col("nippv_cpap_time") <= pl.col("cutoff_12h"))
+        ).alias("nippv_cpap_in_12h"),
+        # 24-hour flags
+        (
+            pl.col("reintubation_time").is_not_null()
+            & (pl.col("reintubation_time") <= pl.col("cutoff_24h"))
+        ).alias("reintubation_in_24h"),
+        (
+            pl.col("death_time").is_not_null()
+            & (pl.col("death_time") > pl.col("extubation_time"))
+            & (pl.col("death_time") <= pl.col("cutoff_24h"))
+        ).alias("death_in_24h"),
+        (
+            pl.col("nippv_cpap_time").is_not_null()
+            & (pl.col("nippv_cpap_time") <= pl.col("cutoff_24h"))
+        ).alias("nippv_cpap_in_24h"),
         # 3-day flags
         (
             pl.col("reintubation_time").is_not_null()
@@ -1430,17 +1460,24 @@ def _(cohort, events, pl):
         ).alias("nippv_cpap_in_7d"),
     ])
 
-    # Compute success outcomes
+    # Compute success outcomes and composite failure outcomes
     flat_outcomes = outcome_base.select([
         "hospitalization_id",
         (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d")).alias("extubation_success_7d"),
         (~pl.col("death_in_7d") & ~pl.col("reintubation_in_7d") & ~pl.col("nippv_cpap_in_7d")).alias("extubation_success_strict_7d"),
         (~pl.col("death_in_3d") & ~pl.col("reintubation_in_3d")).alias("extubation_success_3d"),
         (~pl.col("death_in_3d") & ~pl.col("reintubation_in_3d") & ~pl.col("nippv_cpap_in_3d")).alias("extubation_success_strict_3d"),
+        (~pl.col("death_in_12h") & ~pl.col("reintubation_in_12h")).alias("extubation_success_12h"),
+        (~pl.col("death_in_12h") & ~pl.col("reintubation_in_12h") & ~pl.col("nippv_cpap_in_12h")).alias("extubation_success_strict_12h"),
+        (~pl.col("death_in_24h") & ~pl.col("reintubation_in_24h")).alias("extubation_success_24h"),
+        (~pl.col("death_in_24h") & ~pl.col("reintubation_in_24h") & ~pl.col("nippv_cpap_in_24h")).alias("extubation_success_strict_24h"),
     ])
 
     print(f"Extubation outcomes computed for {len(flat_outcomes)} hospitalizations:")
-    for _c in ["extubation_success_7d", "extubation_success_strict_7d", "extubation_success_3d", "extubation_success_strict_3d"]:
+    for _c in ["extubation_success_7d", "extubation_success_strict_7d",
+               "extubation_success_3d", "extubation_success_strict_3d",
+               "extubation_success_12h", "extubation_success_strict_12h",
+               "extubation_success_24h", "extubation_success_strict_24h"]:
         _n_success = flat_outcomes[_c].sum()
         print(f"  {_c}: {_n_success} ({_n_success / len(flat_outcomes) * 100:.1f}%) success")
     return (flat_outcomes,)
@@ -1504,6 +1541,10 @@ def _(
         "extubation_success_strict_7d",
         "extubation_success_3d",
         "extubation_success_strict_3d",
+        "extubation_success_12h",
+        "extubation_success_strict_12h",
+        "extubation_success_24h",
+        "extubation_success_strict_24h",
     ])
 
     # Save
