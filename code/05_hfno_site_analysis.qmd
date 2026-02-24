@@ -1350,8 +1350,6 @@ writeLines(capture.output(sessionInfo()), here("output_to_share/session_info.txt
 sessionInfo()
 ```
 
-```
-
 ---
 
 # Output File Summary
