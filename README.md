@@ -25,12 +25,19 @@ This is a federated multi-site study using the [Common Longitudinal ICU Format (
 
 ## Pipeline Overview
 
+### Python Steps (automated via `run_all.sh` / `run_all.ps1`)
+
 | Step | File | Description |
-|------------------------|------------------------|------------------------|
+|------|------|-------------|
 | 1 | `code/01_cohort.py` | Applies inclusion/exclusion criteria, detects intubation/extubation events, computes SOFA scores, and outputs the HFNO and low-flow cohorts |
 | 2 | `code/02_hfno_trajectory.py` | Builds a longitudinal panel dataset (one row per hospitalization per 4-hour window, up to 7 days post-extubation) with HFNO settings, vitals, ROX index, and outcomes |
 | 3 | `code/03_extubation_success.py` | Adds 7-day extubation success flags, HFNO weaning outcomes, and life-support-prior-to-extubation indicators to both cohorts |
 | 4 | `code/04_table1.py` | Generates Table 1 (baseline characteristics) comparing HFNO vs low-flow groups |
+
+### R/Quarto Steps (steps 05–06, run manually)
+
+| Step | File | Description |
+|------|------|-------------|
 | 5 | `code/05_hfno_site_analysis.qmd` | Runs the federated marginal structural model analysis with IPTW, sensitivity analyses, and generates all figures/tables for the coordinating site |
 | 6 | `code/06_rox_prediction_site_analysis.qmd` | Runs the federated ROX index predictive analysis with logistic regression, AUROC comparison, and generates site-level results |
 
@@ -55,9 +62,7 @@ Edit `clif_config.json`:
 }
 ```
 
-### 2. Run the full pipeline
-
-The pipeline scripts run **only the Python steps** (01–04). The R/Quarto analyses (steps 05 & 06) must be run separately via RStudio or the `quarto` CLI (see step 3 below).
+### 2. Run the Python pipeline (steps 01–04)
 
 **Linux / macOS:**
 
@@ -82,7 +87,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 uv sync
 ```
 
-#### Run the Python pipeline (in order)
+#### **Python Steps** (run in order)
 
 ``` bash
 uv run python code/01_cohort.py
@@ -91,7 +96,9 @@ uv run python code/03_extubation_success.py
 uv run python code/04_table1.py
 ```
 
-#### Run the R analysis
+#### **R/Quarto Steps** (must be run manually)
+
+> **Note:** The run scripts do NOT execute these steps. Open the `.qmd` files in RStudio or run via the `quarto` CLI below.
 
 Open `code/*.qmd` in RStudio and render it, or from the command line:
 
