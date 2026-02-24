@@ -69,6 +69,7 @@ def _(DATA_DIR, FILETYPE, Hospitalization, SITE, TIMEZONE, pd):
         timezone=TIMEZONE,
     )
     hosp_df_raw = hosp.df.copy()
+    hosp_df_raw["discharge_category"] = hosp_df_raw["discharge_category"].str.lower()
     n_total_hosp = len(hosp_df_raw)
     print(f"Total hospitalizations in database: {n_total_hosp}")
 
@@ -239,6 +240,7 @@ def _(Adt, DATA_DIR, FILETYPE, TIMEZONE, hosp_df_filtered, pl, tqdm):
 
     # Convert to Polars
     adt_df = pl.from_pandas(adt_pd)
+    adt_df = adt_df.with_columns(pl.col("location_category").str.to_lowercase())
     del adt, adt_pd  # Free pandas memory
 
     # Filter to only hospitalizations with at least 1 ICU stay before merging
@@ -347,6 +349,7 @@ def _(
         timezone=TIMEZONE,
         filters={"hospitalization_id": list(hosp_with_icu)},
     )
+    resp.df["device_category"] = resp.df["device_category"].str.lower()
     resp_df_raw = resp.df.copy()
     resp_df_raw = resp_df_raw.sort_values(["hospitalization_id", "recorded_dttm"])
     print(f"Respiratory support records (for {len(hosp_with_icu)} ICU hospitalizations): {len(resp_df_raw)}")
@@ -355,7 +358,7 @@ def _(
     hosp_ever_trach = set(resp_df_raw[resp_df_raw["tracheostomy"] == 1]["hospitalization_id"].unique())
 
     # Identify hospitalizations that ever had IMV
-    hosp_ever_imv = set(resp_df_raw[resp_df_raw["device_category"] == "IMV"]["hospitalization_id"].unique())
+    hosp_ever_imv = set(resp_df_raw[resp_df_raw["device_category"] == "imv"]["hospitalization_id"].unique())
 
     # Keep only hospitalizations with IMV but never tracheostomy
     hosp_imv_no_trach = hosp_ever_imv - hosp_ever_trach
@@ -1198,6 +1201,9 @@ def _(
         filters={"patient_id": all_patient_ids},
     )
     patient_demo = patient_table.df[["patient_id", "sex_category", "race_category", "ethnicity_category", "death_dttm"]].copy()
+    patient_demo["sex_category"] = patient_demo["sex_category"].str.lower()
+    patient_demo["race_category"] = patient_demo["race_category"].str.lower()
+    patient_demo["ethnicity_category"] = patient_demo["ethnicity_category"].str.lower()
     patient_demo["death_dttm"] = pd.to_datetime(patient_demo["death_dttm"], errors="coerce")
     if patient_demo["death_dttm"].dt.tz is not None:
         patient_demo["death_dttm"] = patient_demo["death_dttm"].dt.tz_localize(None)
@@ -1212,7 +1218,7 @@ def _(
         df["hospital_los_hours"] = (
             (df["discharge_dttm"] - df["admission_dttm"]).dt.total_seconds() / 3600
         )
-        df["hospital_mortality"] = df["discharge_category"] == "Expired"
+        df["hospital_mortality"] = df["discharge_category"] == "expired"
         df = df.drop(columns=["death_dttm"])
         return df
 
@@ -1820,7 +1826,7 @@ def _(
         if pd.notna(row.get("death_dttm")) and pd.notna(row.get("icu_end")):
             if row["death_dttm"] <= row["icu_end"]:
                 return "Died in ICU"
-        if row.get("discharge_category") == "Expired" and pd.isna(row.get("next_location_after_icu")):
+        if row.get("discharge_category") == "expired" and pd.isna(row.get("next_location_after_icu")):
             return "Died in ICU"
         # Check transferred from ICU to another location
         if pd.notna(row.get("next_location_after_icu")):

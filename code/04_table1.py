@@ -116,15 +116,15 @@ def _(cci_df, cohort, pl):
 
     # Race/ethnicity combined category
     df = df.with_columns(
-        pl.when(pl.col("ethnicity_category") == "Hispanic")
+        pl.when(pl.col("ethnicity_category") == "hispanic")
         .then(pl.lit("Hispanic"))
-        .when((pl.col("ethnicity_category") == "Unknown") | (pl.col("race_category") == "Unknown"))
+        .when((pl.col("ethnicity_category") == "unknown") | (pl.col("race_category") == "unknown"))
         .then(pl.lit("Not Reported"))
-        .when(pl.col("race_category") == "White")
+        .when(pl.col("race_category") == "white")
         .then(pl.lit("Non-Hispanic White"))
-        .when(pl.col("race_category") == "Black or African American")
+        .when(pl.col("race_category") == "black or african american")
         .then(pl.lit("Non-Hispanic Black"))
-        .when(pl.col("race_category") == "Asian")
+        .when(pl.col("race_category") == "asian")
         .then(pl.lit("Non-Hispanic Asian"))
         .otherwise(pl.lit("Other"))
         .alias("race_ethnicity")
@@ -197,7 +197,7 @@ def _(np, pl):
         stats["Age, years"] = mean_sd(group_df["age_at_admission"])
         stats["Sex, female"] = n_pct(
             group_df["sex_category"],
-            group_df["sex_category"] == "Female"
+            group_df["sex_category"] == "female"
         )
         stats["BMI, kg/m2"] = mean_sd(group_df["bmi"])
 
@@ -329,8 +329,8 @@ def _(np, pl, stats):
         d["N"] = None
         d["Age, years"] = mean_diff_ci(hfno_df["age_at_admission"], no_hfno_df["age_at_admission"])
         d["Sex, female"] = proportion_diff_ci(
-            hfno_df["sex_category"], hfno_df["sex_category"] == "Female",
-            no_hfno_df["sex_category"], no_hfno_df["sex_category"] == "Female",
+            hfno_df["sex_category"], hfno_df["sex_category"] == "female",
+            no_hfno_df["sex_category"], no_hfno_df["sex_category"] == "female",
         )
         d["BMI, kg/m2"] = mean_diff_ci(hfno_df["bmi"], no_hfno_df["bmi"])
 
