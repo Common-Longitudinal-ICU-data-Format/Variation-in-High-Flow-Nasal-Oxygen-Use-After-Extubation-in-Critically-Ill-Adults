@@ -95,7 +95,7 @@ def _(Path, pd, pl):
     del cohort_low_flow_pd
 
     # Combine both cohorts
-    cohort = pl.concat([cohort_hfno, cohort_low_flow])
+    cohort = pl.concat([cohort_hfno, cohort_low_flow], how="vertical_relaxed")
 
     # Add 7-day window end
     cohort = cohort.with_columns(
