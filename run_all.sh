@@ -26,8 +26,11 @@ run_step "01_cohort.py"                   uv run python code/01_cohort.py
 run_step "02_hfno_trajectory.py"          uv run python code/02_hfno_trajectory.py
 run_step "03_extubation_success.py"       uv run python code/03_extubation_success.py
 run_step "04_table1.py"                   uv run python code/04_table1.py
-run_step "05_hfno_site_analysis.qmd"      quarto render code/05_hfno_site_analysis.qmd
-run_step "06_rox_prediction_site_analysis.qmd" quarto render code/06_rox_prediction_site_analysis.qmd
+# ── R/Quarto notice ────────────────────────────────────────────────
+log "Python steps complete."
+log "To finish the analysis, open and render the following files in RStudio:"
+log "  - code/05_hfno_site_analysis.qmd"
+log "  - code/06_rox_prediction_site_analysis.qmd"
 
 # ── Summary ─────────────────────────────────────────────────────────
 TOTAL=$(( SECONDS - SCRIPT_START ))

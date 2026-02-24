@@ -57,6 +57,8 @@ Edit `clif_config.json`:
 
 ### 2. Run the full pipeline
 
+The pipeline scripts run **only the Python steps** (01–04). The R/Quarto analyses (steps 05 & 06) must be run separately via RStudio or the `quarto` CLI (see step 3 below).
+
 **Linux / macOS:**
 
 ``` bash
